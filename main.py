@@ -343,6 +343,7 @@ def generate_tts_audio_segments(
             audio_items.append({
                 "path": mp3_path,
                 "start_us": start_us,
+                "end_us": block['end_ms'] * 1000,
             })
         except PipelineCancelledException:
             shutil.rmtree(temp_dir, ignore_errors=True)
@@ -366,6 +367,8 @@ def create_capcut_draft(
     capcut_draft_dir: str,
     tts_audio_items: list[dict] = None,
     tts_speed: float = 1.0,
+    tts_auto_fit: bool = True,
+    tts_allow_overlap: bool = True,
     subtitle_style: dict = None,
     video_options: dict = None,
     log=print,
@@ -402,6 +405,7 @@ def create_capcut_draft(
         VideoSegment(
             material=mat,
             target_timerange=Timerange(start=0, duration=mat.duration),
+            volume=max(0.0, min(1.0, float(video_options.get("source_volume", 1.0)))),
             clip_settings=ClipSettings(
                 flip_horizontal=bool(video_options.get("mirror_video", False))
             ),
@@ -525,10 +529,14 @@ def create_capcut_draft(
     if tts_audio_items:
         tts_speed = max(0.5, min(2.0, float(tts_speed)))
         os.makedirs(permanent_tts_dir, exist_ok=True)
-        log(f"  [CapCut] Chèn {len(tts_audio_items)} đoạn TTS ở tốc độ {tts_speed:g}×...")
-        script.add_track(TrackType.audio, track_name="tts_speech")
-        last_end_us = 0
+        log(
+            f"  [CapCut] Chèn {len(tts_audio_items)} đoạn TTS ở tốc độ cơ bản {tts_speed:g}× "
+            f"| auto-fit={'on' if tts_auto_fit else 'off'} "
+            f"| overlap={'on' if tts_allow_overlap else 'off'}..."
+        )
+        track_end_times = []
         inserted_count = 0
+        trimmed_count = 0
         for i, item in enumerate(tts_audio_items, start=1):
             src_path = item["path"]
             start_us = item["start_us"]
@@ -539,23 +547,66 @@ def create_capcut_draft(
                     shutil.copy2(src_path, dst_path)
 
                     audio_mat = AudioMaterial(dst_path)
-                    # Tránh chồng chéo (overlap): nếu thời gian bắt đầu nhỏ hơn thời điểm kết thúc câu trước, nối tiếp câu trước
-                    if start_us < last_end_us:
-                        start_us = last_end_us
+                    source_duration = audio_mat.duration
+                    subtitle_end_us = int(item.get("end_us", start_us + source_duration))
+                    subtitle_duration = max(1, subtitle_end_us - start_us)
+                    effective_speed = tts_speed
+                    if tts_auto_fit:
+                        required_speed = source_duration / subtitle_duration
+                        effective_speed = min(2.0, max(tts_speed, required_speed))
+
+                    if not tts_allow_overlap and track_end_times:
+                        start_us = max(start_us, track_end_times[0])
+
+                    available_video_duration = mat.duration - start_us
+                    if available_video_duration <= 0:
+                        log(f"  [CapCut Audio Warning] Bỏ qua câu {i}: bắt đầu ngoài thời lượng video.")
+                        continue
+
+                    source_to_use = min(
+                        source_duration,
+                        max(1, round(available_video_duration * effective_speed)),
+                    )
+                    if source_to_use < source_duration:
+                        trimmed_count += 1
+
+                    target_duration = max(1, round(source_to_use / effective_speed))
+                    segment_end_us = start_us + target_duration
+
+                    if tts_allow_overlap:
+                        track_index = next(
+                            (idx for idx, end_us in enumerate(track_end_times) if end_us <= start_us),
+                            None,
+                        )
+                        if track_index is None:
+                            track_index = len(track_end_times)
+                            track_end_times.append(0)
+                            script.add_track(
+                                TrackType.audio,
+                                track_name=f"tts_speech_{track_index + 1}",
+                            )
+                    else:
+                        track_index = 0
+                        if not track_end_times:
+                            track_end_times.append(0)
+                            script.add_track(TrackType.audio, track_name="tts_speech_1")
 
                     audio_seg = AudioSegment(
                         material=audio_mat,
-                        target_timerange=Timerange(start=start_us, duration=audio_mat.duration),
-                        source_timerange=Timerange(start=0, duration=audio_mat.duration),
-                        speed=tts_speed,
+                        target_timerange=Timerange(start=start_us, duration=target_duration),
+                        source_timerange=Timerange(start=0, duration=source_to_use),
+                        speed=effective_speed,
                     )
-                    script.add_segment(audio_seg, track_name="tts_speech")
-                    last_end_us = start_us + audio_seg.duration
+                    script.add_segment(audio_seg, track_name=f"tts_speech_{track_index + 1}")
+                    track_end_times[track_index] = segment_end_us
                     inserted_count += 1
                 except Exception as e:
                     log(f"  [CapCut Audio Warning] Không thể chèn audio {src_path}: {e}")
 
-        log(f"  [CapCut] Đã chèn thành công {inserted_count}/{len(tts_audio_items)} đoạn âm thanh vào timeline.")
+        log(
+            f"  [CapCut] Đã chèn {inserted_count}/{len(tts_audio_items)} đoạn vào "
+            f"{len(track_end_times)} track; cắt cuối video: {trimmed_count} đoạn."
+        )
 
     script.save()
     log(f"  [CapCut] Draft saved: {draft_path}")
@@ -578,6 +629,8 @@ def run_pipeline(
     enable_tts: bool = False,
     tts_voice: str = "BV421_vivn_streaming",
     tts_speed: float = 1.0,
+    tts_auto_fit: bool = True,
+    tts_allow_overlap: bool = True,
     subtitle_style: dict = None,
     video_options: dict = None,
     log=print,
@@ -687,6 +740,8 @@ def run_pipeline(
             capcut_draft_dir=capcut_draft_dir,
             tts_audio_items=tts_audio_items,
             tts_speed=tts_speed,
+            tts_auto_fit=tts_auto_fit,
+            tts_allow_overlap=tts_allow_overlap,
             subtitle_style=subtitle_style,
             video_options=video_options,
             log=log,

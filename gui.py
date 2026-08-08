@@ -33,6 +33,9 @@ DEFAULT_SETTINGS = {
     "enable_tts":         False,
     "tts_voice":          "BV421_vivn_streaming",
     "tts_speed":          1.0,
+    "tts_auto_fit":       True,
+    "tts_allow_overlap":  True,
+    "source_volume":      100.0,
     "text_color":         "#ffffff",
     "text_size":          7.0,
     "text_bold":          True,
@@ -403,6 +406,27 @@ class BiliCutApp:
         tk.Label(self.row_t2, text="×", fg=DIM, bg=SURFACE,
                  font=SANS).pack(side="left", padx=(4, 0))
 
+        self.row_t3 = tk.Frame(tf, bg=SURFACE)
+        self.var_tts_auto_fit = tk.BooleanVar(value=True)
+        tk.Checkbutton(self.row_t3, text="Tự tăng tốc để khớp phụ đề",
+                       variable=self.var_tts_auto_fit, bg=SURFACE, fg=TEXT,
+                       selectcolor=SURFACE2, activebackground=SURFACE,
+                       activeforeground=TEXT, font=SANS).pack(side="left", padx=(0, 12))
+        self.var_tts_allow_overlap = tk.BooleanVar(value=True)
+        tk.Checkbutton(self.row_t3, text="Cho phép chồng tiếng, giữ đúng timestamp",
+                       variable=self.var_tts_allow_overlap, bg=SURFACE, fg=TEXT,
+                       selectcolor=SURFACE2, activebackground=SURFACE,
+                       activeforeground=TEXT, font=SANS).pack(side="left", padx=(0, 12))
+        tk.Label(self.row_t3, text="Âm thanh gốc", fg=TEXT, bg=SURFACE,
+                 font=SANS).pack(side="left")
+        self.var_source_volume = tk.DoubleVar(value=100.0)
+        tk.Spinbox(self.row_t3, from_=0.0, to=100.0, increment=5.0,
+                   textvariable=self.var_source_volume, width=5, bg=SURFACE2, fg=TEXT,
+                   buttonbackground=BORDER, insertbackground=TEXT, relief="flat",
+                   font=SANS).pack(side="left", padx=(6, 3), ipady=4)
+        tk.Label(self.row_t3, text="%", fg=DIM, bg=SURFACE,
+                 font=SANS).pack(side="left")
+
         # ── Video enhancements ──
         vf2 = make_lf(body, "Logo kênh và hướng video")
         vf2.pack(fill="x", pady=(0, 10))
@@ -553,6 +577,9 @@ class BiliCutApp:
             idx = self.tts_codes.index(saved_voice_code)
             self.var_tts_voice_lbl.set(self.tts_labels[idx])
         self.var_tts_speed.set(self.cfg.get("tts_speed", 1.0))
+        self.var_tts_auto_fit.set(self.cfg.get("tts_auto_fit", True))
+        self.var_tts_allow_overlap.set(self.cfg.get("tts_allow_overlap", True))
+        self.var_source_volume.set(self.cfg.get("source_volume", 100.0))
         self._toggle_tts()
 
         self.var_text_color.set(self.cfg.get("text_color", "#ffffff"))
@@ -586,8 +613,10 @@ class BiliCutApp:
     def _toggle_tts(self):
         if self.var_tts_enable.get():
             self.row_t2.pack(fill="x", pady=(0, 4))
+            self.row_t3.pack(fill="x", pady=(0, 4))
         else:
             self.row_t2.pack_forget()
+            self.row_t3.pack_forget()
 
     def _toggle_logo(self):
         if self.var_logo_enabled.get():
@@ -620,6 +649,10 @@ class BiliCutApp:
         except (tk.TclError, ValueError):
             tts_speed = self.cfg.get("tts_speed", 1.0)
         try:
+            source_volume = float(self.var_source_volume.get())
+        except (tk.TclError, ValueError):
+            source_volume = self.cfg.get("source_volume", 100.0)
+        try:
             logo_scale = float(self.var_logo_scale.get()) / 100.0
         except (tk.TclError, ValueError):
             logo_scale = self.cfg.get("logo_scale", 0.20)
@@ -648,6 +681,9 @@ class BiliCutApp:
             "tts_voice":          self.tts_codes[self.tts_labels.index(voice_label)]
                                   if voice_label in self.tts_labels else self.tts_codes[0],
             "tts_speed":          max(0.5, min(2.0, tts_speed)),
+            "tts_auto_fit":       self.var_tts_auto_fit.get(),
+            "tts_allow_overlap":  self.var_tts_allow_overlap.get(),
+            "source_volume":      max(0.0, min(100.0, source_volume)),
             "text_color":         self.var_text_color.get(),
             "text_size":          max(4.0, min(30.0, text_size)),
             "text_bold":          self.var_text_bold.get(),
@@ -724,15 +760,19 @@ class BiliCutApp:
             text_size = float(self.var_text_size.get())
             stroke_width = float(self.var_stroke_width.get())
             tts_speed = float(self.var_tts_speed.get())
+            source_volume = float(self.var_source_volume.get())
             logo_scale = float(self.var_logo_scale.get()) / 100.0
         except (tk.TclError, ValueError):
             messagebox.showerror(
                 "Giá trị không hợp lệ",
-                "Tốc độ giọng đọc, kích thước logo, cỡ chữ và độ dày viền phải là số.",
+                "Tốc độ giọng đọc, âm lượng gốc, kích thước logo, cỡ chữ và độ dày viền phải là số.",
             )
             return
         if not 0.5 <= tts_speed <= 2.0:
             messagebox.showerror("Tốc độ không hợp lệ", "Tốc độ giọng đọc phải từ 0.5× đến 2.0×.")
+            return
+        if not 0.0 <= source_volume <= 100.0:
+            messagebox.showerror("Âm lượng không hợp lệ", "Âm thanh gốc phải từ 0% đến 100%.")
             return
         if not 0.05 <= logo_scale <= 0.50:
             messagebox.showerror("Kích thước không hợp lệ", "Kích thước logo phải từ 5% đến 50%.")
@@ -753,6 +793,7 @@ class BiliCutApp:
             "logo_position": self.logo_position_codes[
                                  self.logo_position_labels.index(logo_position_label)],
             "logo_scale":    logo_scale,
+            "source_volume": source_volume / 100.0,
         }
         subtitle_style = {
             "text_color":         self.var_text_color.get(),
@@ -812,6 +853,8 @@ class BiliCutApp:
                     enable_tts=enable_tts,
                     tts_voice=tts_voice,
                     tts_speed=tts_speed,
+                    tts_auto_fit=self.var_tts_auto_fit.get(),
+                    tts_allow_overlap=self.var_tts_allow_overlap.get(),
                     subtitle_style=subtitle_style,
                     log=self._log_fn,
                     cancel_event=self.cancel_event,
