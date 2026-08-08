@@ -4,6 +4,7 @@ BiliCut GUI – Dark-themed Tkinter interface with persistent settings
 
 import os
 import json
+import sys
 import threading
 import tkinter as tk
 from tkinter import colorchooser, filedialog, ttk, messagebox
@@ -13,6 +14,25 @@ from tkinter import colorchooser, filedialog, ttk, messagebox
 # ──────────────────────────────────────────────
 BASE_DIR      = os.path.dirname(os.path.abspath(__file__))
 SETTINGS_FILE = os.path.join(BASE_DIR, ".bilicut_settings.json")
+
+
+def resource_path(*parts) -> str:
+    """Resolve bundled assets in source, PyInstaller onedir, and onefile modes."""
+    bundle_dir = getattr(sys, "_MEIPASS", BASE_DIR)
+    return os.path.join(bundle_dir, *parts)
+
+
+def set_windows_app_id():
+    """Give Windows a stable identity so the taskbar uses BiliCut's icon."""
+    if sys.platform != "win32":
+        return
+    try:
+        import ctypes
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(
+            "BiliCut.VideoSubtitleTool.1"
+        )
+    except (AttributeError, OSError):
+        pass
 
 DEFAULT_SETTINGS = {
     "video_path":         "",
@@ -213,6 +233,7 @@ class BiliCutApp:
         self.root = root
         self.cfg  = load_settings()
         self.cancel_event = threading.Event()
+        set_windows_app_id()
         self._setup_window()
         self._build_ui()
         self._load_into_ui()
@@ -222,6 +243,13 @@ class BiliCutApp:
     def _setup_window(self):
         self.root.title("BiliCut — Tạo phụ đề và draft CapCut")
         self.root.configure(bg=BG)
+        icon_path = resource_path("assets", "icon.png")
+        if os.path.isfile(icon_path):
+            try:
+                self._app_icon = tk.PhotoImage(file=icon_path)
+                self.root.iconphoto(True, self._app_icon)
+            except tk.TclError:
+                self._app_icon = None
         self.root.resizable(True, True)
         self.root.minsize(720, 640)
         w, h = 820, 760
