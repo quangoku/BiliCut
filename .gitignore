@@ -1,0 +1,5 @@
+/__pycache__
+/models
+ffmpeg.exe
+ffprobe.exe
+.bilicut_settings.json
