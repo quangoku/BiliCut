@@ -71,7 +71,12 @@ def transcribe_to_srt(
     n_threads: int = 8,
     log=print,
 ) -> str:
-    log("  [Whisper] Loading model…")
+    model_path = os.path.join(MODELS_DIR, f"ggml-{model_name}.bin")
+    os.makedirs(MODELS_DIR, exist_ok=True)
+    if os.path.exists(model_path):
+        log(f"  [Whisper] Đang dùng model '{model_name}' đã cài đặt…")
+    else:
+        log(f"  [Whisper] Model '{model_name}' chưa có, đang tự động tải xuống…")
     kwargs = {"models_dir": MODELS_DIR, "model": model_name, "n_threads": n_threads}
     if language:
         kwargs["language"] = language
@@ -230,7 +235,8 @@ from capcut_tts_api import CapCutClient
 from pycapcut import (
     DraftFolder, VideoMaterial, VideoSegment,
     Timerange, TrackType, TextStyle,
-    AudioMaterial, AudioSegment,
+    AudioMaterial, AudioSegment, TextSegment,
+    TextBorder, TextBackground, ClipSettings,
 )
 
 # ──────────────────────────────────────
@@ -359,6 +365,9 @@ def create_capcut_draft(
     video_info: dict,
     capcut_draft_dir: str,
     tts_audio_items: list[dict] = None,
+    tts_speed: float = 1.0,
+    subtitle_style: dict = None,
+    video_options: dict = None,
     log=print,
 ) -> str:
     if not os.path.isdir(capcut_draft_dir):
@@ -384,6 +393,7 @@ def create_capcut_draft(
     draft_path = os.path.join(capcut_draft_dir, draft_name)
     permanent_tts_dir = os.path.join(draft_path, "tts_audio")
 
+    video_options = video_options or {}
     log("  [CapCut] Adding video track...")
     script.add_track(TrackType.video)
 
@@ -392,29 +402,130 @@ def create_capcut_draft(
         VideoSegment(
             material=mat,
             target_timerange=Timerange(start=0, duration=mat.duration),
+            clip_settings=ClipSettings(
+                flip_horizontal=bool(video_options.get("mirror_video", False))
+            ),
         )
     )
+    if video_options.get("mirror_video", False):
+        log("  [CapCut] Video đã được lật ngang trái/phải.")
+
+    if video_options.get("logo_enabled", False):
+        logo_path = os.path.abspath(video_options.get("logo_path", ""))
+        if not os.path.isfile(logo_path):
+            raise FileNotFoundError(f"Không tìm thấy ảnh logo: {logo_path}")
+
+        logo_dir = os.path.join(draft_path, "logo")
+        os.makedirs(logo_dir, exist_ok=True)
+        extension = os.path.splitext(logo_path)[1].lower() or ".png"
+        permanent_logo_path = os.path.join(logo_dir, f"channel_logo{extension}")
+        shutil.copy2(logo_path, permanent_logo_path)
+
+        logo_position = video_options.get("logo_position", "top_right")
+        valid_positions = {"top_left", "top_right", "bottom_left", "bottom_right"}
+        if logo_position not in valid_positions:
+            raise ValueError(f"Vị trí logo không hợp lệ: {logo_position}")
+        logo_scale = max(0.05, min(0.50, float(video_options.get("logo_scale", 0.20))))
+
+        logo_material = VideoMaterial(permanent_logo_path)
+        # logo_scale is the desired fraction of canvas width, independent of source image resolution.
+        visual_scale = (video_info["width"] * logo_scale) / max(1, logo_material.width)
+        logo_height_ratio = (logo_material.height * visual_scale) / max(1, video_info["height"])
+        safe_margin = 0.04
+        x_offset = max(0.0, 1.0 - safe_margin - logo_scale)
+        y_offset = max(0.0, 1.0 - safe_margin - logo_height_ratio)
+        transform_x = -x_offset if logo_position.endswith("left") else x_offset
+        transform_y = y_offset if logo_position.startswith("top") else -y_offset
+
+        script.add_track(TrackType.video, track_name="channel_logo", relative_index=999)
+        script.add_segment(
+            VideoSegment(
+                material=logo_material,
+                target_timerange=Timerange(start=0, duration=mat.duration),
+                clip_settings=ClipSettings(
+                    scale_x=visual_scale,
+                    scale_y=visual_scale,
+                    transform_x=transform_x,
+                    transform_y=transform_y,
+                ),
+            ),
+            track_name="channel_logo",
+        )
+        log(f"  [CapCut] Logo: {logo_position}, size={logo_scale * 100:g}%")
 
     log("  [CapCut] Importing SRT subtitles...")
+    subtitle_style = subtitle_style or {}
+
+    def hex_to_rgb(value, fallback):
+        value = str(value or "").strip().lstrip("#")
+        if len(value) != 6:
+            return fallback
+        try:
+            return tuple(int(value[i:i + 2], 16) / 255.0 for i in (0, 2, 4))
+        except ValueError:
+            return fallback
+
     style = TextStyle(
-        size=7.0,
-        bold=False,
-        color=(1.0, 1.0, 1.0),
+        size=float(subtitle_style.get("text_size", 7.0)),
+        bold=bool(subtitle_style.get("text_bold", True)),
+        color=hex_to_rgb(subtitle_style.get("text_color"), (1.0, 1.0, 1.0)),
         align=1,
         auto_wrapping=True,
         max_line_width=0.85,
     )
 
+    border = None
+    if subtitle_style.get("stroke_enabled", True):
+        border = TextBorder(
+            alpha=float(subtitle_style.get("stroke_alpha", 1.0)),
+            color=hex_to_rgb(subtitle_style.get("stroke_color"), (0.0, 0.0, 0.0)),
+            width=float(subtitle_style.get("stroke_width", 40.0)),
+        )
+
+    shadow_requested = bool(subtitle_style.get("shadow_enabled", False))
+    if shadow_requested:
+        log("  [CapCut] Phiên bản pycapcut hiện tại chưa hỗ trợ bóng chữ; bỏ qua tùy chọn này.")
+
+    background = None
+    if subtitle_style.get("background_enabled", False):
+        background = TextBackground(
+            color=subtitle_style.get("background_color", "#000000"),
+            style=2,
+            alpha=float(subtitle_style.get("background_alpha", 0.65)),
+            round_radius=0.4,
+            height=0.28,
+            width=0.28,
+            horizontal_offset=0.5,
+            vertical_offset=0.5,
+        )
+
+    style_reference = TextSegment(
+        "BiliCut subtitle style",
+        Timerange(start=0, duration=1_000_000),
+        style=style,
+        border=border,
+        background=background,
+    )
+
+    log(
+        "  [CapCut] Subtitle style: "
+        f"size={style.size:g}, color={subtitle_style.get('text_color', '#ffffff')}, "
+        f"bold={style.bold}, border={'on' if border else 'off'}, "
+        f"shadow={'unsupported' if shadow_requested else 'off'}, "
+        f"background={'on' if background else 'off'}"
+    )
+
     script.import_srt(
         srt_path=os.path.abspath(srt_path),
         track_name="subtitles",
-        text_style=style,
+        style_reference=style_reference,
     )
 
     # Chèn các đoạn audio giọng đọc TTS vào audio track nếu có
     if tts_audio_items:
+        tts_speed = max(0.5, min(2.0, float(tts_speed)))
         os.makedirs(permanent_tts_dir, exist_ok=True)
-        log(f"  [CapCut] Chèn {len(tts_audio_items)} đoạn giọng đọc TTS vào audio track...")
+        log(f"  [CapCut] Chèn {len(tts_audio_items)} đoạn TTS ở tốc độ {tts_speed:g}×...")
         script.add_track(TrackType.audio, track_name="tts_speech")
         last_end_us = 0
         inserted_count = 0
@@ -434,10 +545,12 @@ def create_capcut_draft(
 
                     audio_seg = AudioSegment(
                         material=audio_mat,
-                        target_timerange=Timerange(start=start_us, duration=audio_mat.duration)
+                        target_timerange=Timerange(start=start_us, duration=audio_mat.duration),
+                        source_timerange=Timerange(start=0, duration=audio_mat.duration),
+                        speed=tts_speed,
                     )
                     script.add_segment(audio_seg, track_name="tts_speech")
-                    last_end_us = start_us + audio_mat.duration
+                    last_end_us = start_us + audio_seg.duration
                     inserted_count += 1
                 except Exception as e:
                     log(f"  [CapCut Audio Warning] Không thể chèn audio {src_path}: {e}")
@@ -458,11 +571,15 @@ def run_pipeline(
     capcut_draft_dir: str,
     model_name: str = "small",
     language=None,
+    aspect_ratio: str = "9:16",
     n_threads: int = 8,
     enable_translation: bool = False,
     gemini_api_key: str = "",
     enable_tts: bool = False,
     tts_voice: str = "BV421_vivn_streaming",
+    tts_speed: float = 1.0,
+    subtitle_style: dict = None,
+    video_options: dict = None,
     log=print,
     cancel_event=None,
 ) -> str:
@@ -491,7 +608,15 @@ def run_pipeline(
         # 1. Video info
         log(f"\n[1/6] Reading video info: {os.path.basename(video_path)}")
         vinfo = get_video_info(video_path)
-        log(f"  {vinfo['width']}x{vinfo['height']} @ {vinfo['fps']}fps  "
+        source_size = (vinfo["width"], vinfo["height"])
+        if aspect_ratio == "9:16":
+            vinfo["width"], vinfo["height"] = 1080, 1920
+        elif aspect_ratio == "16:9":
+            vinfo["width"], vinfo["height"] = 1920, 1080
+        else:
+            raise ValueError(f"Tỷ lệ khung hình không hợp lệ: {aspect_ratio}")
+        log(f"  Source: {source_size[0]}x{source_size[1]} | "
+            f"Canvas {aspect_ratio}: {vinfo['width']}x{vinfo['height']} @ {vinfo['fps']}fps  "
             f"| {vinfo['duration_us']/1e6:.1f}s")
 
         check_cancelled(cancel_event)
@@ -561,6 +686,9 @@ def run_pipeline(
             video_info=vinfo,
             capcut_draft_dir=capcut_draft_dir,
             tts_audio_items=tts_audio_items,
+            tts_speed=tts_speed,
+            subtitle_style=subtitle_style,
+            video_options=video_options,
             log=log,
         )
 
