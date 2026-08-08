@@ -131,7 +131,7 @@ class BiliCutApp:
 
     # ── window ──────────────────────────────
     def _setup_window(self):
-        self.root.title("BiliCut  -  Video > SRT > CapCut")
+        self.root.title("BiliCut")
         self.root.configure(bg=BG)
         self.root.resizable(True, True)
         self.root.minsize(660, 560)
