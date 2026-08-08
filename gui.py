@@ -23,6 +23,8 @@ DEFAULT_SETTINGS = {
     "language":           "Auto detect",
     "enable_translation": False,
     "gemini_api_key":     "",
+    "enable_tts":         False,
+    "tts_voice":          "BV421_vivn_streaming",
 }
 
 
@@ -64,6 +66,21 @@ LANGUAGES = [
     ("Auto detect", None), ("Chinese (zh)", "zh"), ("English (en)", "en"),
     ("Japanese (ja)", "ja"), ("Korean (ko)", "ko"), ("Vietnamese (vi)", "vi"),
     ("French (fr)", "fr"), ("German (de)", "de"), ("Spanish (es)", "es"),
+]
+
+TTS_VOICES = [
+    ("Nhỏ Ngọt Ngào (Nữ - Tiếng Việt)", "BV421_vivn_streaming"),
+    ("Giọng Nữ Phổ Thông (Tiếng Việt)", "vi_female_huong"),
+    ("Cô Gái Hoạt Ngôn (Nữ - Tiếng Việt)", "BV074_streaming"),
+    ("Hoài Mỹ (Nữ - Tiếng Việt)", "vi-VN-HoaiMyNeural"),
+    ("Nam Minh (Nam - Tiếng Việt)", "vi-VN-NamMinhNeural"),
+    ("Review Phim New (Nữ - Tiếng Việt)", "multi_female_richgirl_uranus_bigtts"),
+    ("Bản Tin 1 (Nữ - Tiếng Việt)", "multi_female_quanweinv_uranus_bigtts"),
+    ("Review Phim 4 (Nữ - Tiếng Việt)", "multi_female_stokie_uranus_bigtts"),
+    ("Ban Mai (Nữ - Tiếng Việt)", "multi_female_yangguangnv_uranus_bigtts"),
+    ("Giọng Bé (Tiếng Việt)", "BV074_streaming_dsp"),
+    ("Việt Méo (Tiếng Việt)", "BV075_streaming_vibrato_dsp"),
+    ("Mai (Nữ - Tiếng Việt)", "BV562_streaming"),
 ]
 
 
@@ -125,6 +142,7 @@ class BiliCutApp:
     def __init__(self, root: tk.Tk):
         self.root = root
         self.cfg  = load_settings()
+        self.cancel_event = threading.Event()
         self._setup_window()
         self._build_ui()
         self._load_into_ui()
@@ -134,8 +152,8 @@ class BiliCutApp:
         self.root.title("BiliCut")
         self.root.configure(bg=BG)
         self.root.resizable(True, True)
-        self.root.minsize(660, 560)
-        w, h = 760, 660
+        self.root.minsize(680, 620)
+        w, h = 780, 720
         sw, sh = self.root.winfo_screenwidth(), self.root.winfo_screenheight()
         self.root.geometry(f"{w}x{h}+{(sw-w)//2}+{(sh-h)//2}")
 
@@ -237,9 +255,42 @@ class BiliCutApp:
                          highlightthickness=1, highlightbackground=BORDER, highlightcolor=ACCENT)
         e_key.pack(side="left", fill="x", expand=True, ipady=4)
 
-        # ── start button ──
-        self.btn = make_btn(body, "Start Pipeline", self._start)
-        self.btn.pack(fill="x", pady=(6, 8), ipady=6)
+        # ── CapCut TTS Speech ──
+        tf = make_lf(body, "🗣️  CapCut TTS Speech (Giọng đọc AI)")
+        tf.pack(fill="x", pady=(0, 10))
+
+        row_t1 = tk.Frame(tf, bg=SURFACE)
+        row_t1.pack(fill="x", pady=(0, 6))
+        self.var_tts_enable = tk.BooleanVar(value=False)
+        chk_tts = tk.Checkbutton(
+            row_t1, text="Tạo giọng đọc AI từ phụ đề (sử dụng CapCut TTS API)",
+            variable=self.var_tts_enable, bg=SURFACE, fg=TEXT,
+            selectcolor=SURFACE2, activebackground=SURFACE,
+            activeforeground=TEXT, font=SANS, cursor="hand2",
+            command=self._toggle_tts,
+        )
+        chk_tts.pack(side="left")
+
+        self.row_t2 = tk.Frame(tf, bg=SURFACE)
+        self.row_t2.pack(fill="x")
+        tk.Label(self.row_t2, text="Giọng đọc (Voice):", fg=TEXT, bg=SURFACE, font=SANS).pack(side="left", padx=(0, 8))
+        self.tts_labels = [l for l, _ in TTS_VOICES]
+        self.tts_codes  = [c for _, c in TTS_VOICES]
+        self.var_tts_voice_lbl = tk.StringVar(value=self.tts_labels[0])
+        ttk.Combobox(self.row_t2, textvariable=self.var_tts_voice_lbl,
+                     values=self.tts_labels, state="readonly",
+                     style="D.TCombobox", font=SANS, width=28).pack(side="left", fill="x", expand=True, ipady=4)
+
+        # ── start / cancel buttons ──
+        btn_row = tk.Frame(body, bg=BG)
+        btn_row.pack(fill="x", pady=(6, 8))
+
+        self.btn_start = make_btn(btn_row, "▶  Start Pipeline", self._start)
+        self.btn_start.pack(side="left", fill="x", expand=True, padx=(0, 8), ipady=6)
+
+        self.btn_cancel = make_btn(btn_row, "⏹  Cancel", self._cancel, bg=SURFACE2, fg=ERROR)
+        self.btn_cancel.config(state="disabled")
+        self.btn_cancel.pack(side="right", ipady=6, padx=(0, 0))
 
         # ── progress ──
         self.progress = ttk.Progressbar(body, mode="indeterminate")
@@ -270,10 +321,23 @@ class BiliCutApp:
         self.var_gemini_key.set(self.cfg.get("gemini_api_key", ""))
         self._toggle_translation()
 
-    # ── translation toggle ───────────
+        self.var_tts_enable.set(self.cfg.get("enable_tts", False))
+        saved_voice_code = self.cfg.get("tts_voice", "BV421_vivn_streaming")
+        if saved_voice_code in self.tts_codes:
+            idx = self.tts_codes.index(saved_voice_code)
+            self.var_tts_voice_lbl.set(self.tts_labels[idx])
+        self._toggle_tts()
+
+    # ── toggles ───────────
     def _toggle_translation(self):
         st = "normal" if self.var_translate.get() else "disabled"
         for w in self.row_g2.winfo_children():
+            try: w.config(state=st)
+            except Exception: pass
+
+    def _toggle_tts(self):
+        st = "normal" if self.var_tts_enable.get() else "disabled"
+        for w in self.row_t2.winfo_children():
             try: w.config(state=st)
             except Exception: pass
 
@@ -298,20 +362,28 @@ class BiliCutApp:
     def _log_fn(self, *args, **_):
         msg = " ".join(str(a) for a in args)
         low = msg.lower()
-        tag = ("ok"  if "done" in low or "thành công" in low else
-               "err" if "error" in low or "lỗi" in low or "not found" in low else
+        tag = ("ok"  if "done" in low or "thành công" in low or "hoàn tất" in low else
+               "err" if "error" in low or "lỗi" in low or "not found" in low or "hủy" in low else
                "acc" if msg.startswith("[") or "===" in msg else "")
         self._write_log(msg, tag)
 
     def _set_busy(self, busy: bool):
         def _do():
             if busy:
-                self.btn.config(state="disabled", text="Running...")
+                self.btn_start.config(state="disabled", text="⏳  Running...")
+                self.btn_cancel.config(state="normal", text="⏹  Cancel", bg=ERROR, fg="white")
                 self.progress.start(10)
             else:
-                self.btn.config(state="normal", text="Start Pipeline")
+                self.btn_start.config(state="normal", text="▶  Start Pipeline")
+                self.btn_cancel.config(state="disabled", text="⏹  Cancel", bg=SURFACE2, fg=ERROR)
                 self.progress.stop()
         self.root.after(0, _do)
+
+    def _cancel(self):
+        if self.cancel_event:
+            self.cancel_event.set()
+            self._log_fn("\n[CANCEL] Đang gửi yêu cầu hủy tiến trình, vui lòng chờ...", "err")
+            self.btn_cancel.config(state="disabled", text="⏳ Cancelling...")
 
     # ── start ───────────────────────────────
     def _start(self):
@@ -322,6 +394,9 @@ class BiliCutApp:
         lang         = self.lang_codes[self.lang_labels.index(lang_lbl)]
         enable_trans = self.var_translate.get()
         gemini_key   = self.var_gemini_key.get().strip()
+        enable_tts   = self.var_tts_enable.get()
+        tts_lbl      = self.var_tts_voice_lbl.get()
+        tts_voice    = self.tts_codes[self.tts_labels.index(tts_lbl)]
 
         if not video:
             messagebox.showerror("Missing", "Please select a video file!"); return
@@ -332,12 +407,17 @@ class BiliCutApp:
         if enable_trans and not gemini_key:
             messagebox.showerror("Missing", "Vui lòng nhập Gemini API Key để dịch sang tiếng Việt!"); return
 
-        # Save model/language/translation preference
+        # Reset cancel event
+        self.cancel_event.clear()
+
+        # Save settings
         self.cfg.update({
             "model":              model,
             "language":           lang_lbl,
             "enable_translation": enable_trans,
             "gemini_api_key":     gemini_key,
+            "enable_tts":         enable_tts,
+            "tts_voice":          tts_voice,
         })
         save_settings(self.cfg)
 
@@ -350,7 +430,7 @@ class BiliCutApp:
 
         def _run():
             try:
-                from main import run_pipeline
+                from main import run_pipeline, PipelineCancelledException
                 run_pipeline(
                     video_path=video,
                     capcut_draft_dir=draft_dir,
@@ -359,10 +439,16 @@ class BiliCutApp:
                     n_threads=8,
                     enable_translation=enable_trans,
                     gemini_api_key=gemini_key,
+                    enable_tts=enable_tts,
+                    tts_voice=tts_voice,
                     log=self._log_fn,
+                    cancel_event=self.cancel_event,
                 )
                 self.root.after(0, lambda: messagebox.showinfo(
                     "Done", "CapCut draft created!\nOpen CapCut to check."))
+            except PipelineCancelledException:
+                self._log_fn("\n[CANCELLED] Tiến trình đã được hủy và dọn dẹp file tạm thành công.", "err")
+                self.root.after(0, lambda: messagebox.showinfo("Cancelled", "Đã hủy tiến trình."))
             except Exception as e:
                 msg = str(e)
                 self._log_fn(f"[ERROR] {msg}")

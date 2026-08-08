@@ -15,11 +15,22 @@ from pycapcut import (
 )
 
 # ──────────────────────────────────────
-# PATHS
+# PATHS & CANCELLATION
 # ──────────────────────────────────────
 BASE_DIR   = os.path.dirname(os.path.abspath(__file__))
 MODELS_DIR = os.path.join(BASE_DIR, "models")
 FFMPEG_BIN = os.path.join(BASE_DIR, "ffmpeg.exe")
+
+
+class PipelineCancelledException(Exception):
+    """Exception raised when user cancels the pipeline."""
+    pass
+
+
+def check_cancelled(cancel_event=None):
+    if cancel_event and cancel_event.is_set():
+        raise PipelineCancelledException("Tiến trình đã bị hủy bởi người dùng.")
+
 
 
 # ──────────────────────────────────────
@@ -214,8 +225,131 @@ def translate_srt_gemini(
     return output_srt_path
 
 
+import re
+from capcut_tts_api import CapCutClient
+from pycapcut import (
+    DraftFolder, VideoMaterial, VideoSegment,
+    Timerange, TrackType, TextStyle,
+    AudioMaterial, AudioSegment,
+)
+
 # ──────────────────────────────────────
-# STEP 5 – Create CapCut draft
+# STEP 5 – Parse SRT & Generate CapCut TTS Speech
+# ──────────────────────────────────────
+
+def parse_srt_blocks(srt_path: str) -> list[dict]:
+    """Parse SRT file into a list of dicts: [{'start_ms': int, 'end_ms': int, 'text': str}]"""
+    if not os.path.exists(srt_path):
+        return []
+    with open(srt_path, "r", encoding="utf-8-sig") as f:
+        content = f.read()
+
+    blocks = []
+    pattern = re.compile(
+        r'(\d+)\s*\n'
+        r'(\d{2}):(\d{2}):(\d{2})[,.](\d{3})\s*-->\s*(\d{2}):(\d{2}):(\d{2})[,.](\d{3})\s*\n'
+        r'(.*?)(?=\n\s*\n\d+|\n\s*$|\Z)',
+        re.DOTALL
+    )
+    for match in pattern.finditer(content):
+        sh, sm, ss, sms = map(int, match.group(2, 3, 4, 5))
+        eh, em, es, ems = map(int, match.group(6, 7, 8, 9))
+        text = match.group(10).strip()
+        if text:
+            start_ms = (sh * 3600 + sm * 60 + ss) * 1000 + sms
+            end_ms = (eh * 3600 + em * 60 + es) * 1000 + ems
+            blocks.append({
+                'start_ms': start_ms,
+                'end_ms': end_ms,
+                'text': text
+            })
+    return blocks
+
+
+def extract_audio_url_and_duration(res: dict) -> tuple[str, int]:
+    """Extract (speech_url, duration_ms) from CapCut TTS generate_speech response."""
+    tasks = (res.get("data") or {}).get("tasks") or []
+    if not tasks:
+        return None, 0
+    task = tasks[0]
+
+    # Check payload first (query_tts_task response)
+    if "payload" in task and task["payload"]:
+        try:
+            p = json.loads(task["payload"]) if isinstance(task["payload"], str) else task["payload"]
+            audios = p.get("audio_subtitles") or []
+            if audios and "speech_url" in audios[0]:
+                return audios[0]["speech_url"], audios[0].get("duration", 0)
+        except Exception:
+            pass
+
+    # Check sub_tasks (create_tts_task response)
+    sub_tasks = task.get("sub_tasks") or []
+    if sub_tasks and "url" in sub_tasks[0]:
+        return sub_tasks[0]["url"], sub_tasks[0].get("duration", 0)
+
+    return None, 0
+
+
+import shutil
+
+
+def generate_tts_audio_segments(
+    srt_path: str,
+    voice_type: str = "BV421_vivn_streaming",
+    log=print,
+    cancel_event=None,
+) -> tuple[list[dict], str]:
+    """
+    Generate speech MP3 for each SRT subtitle block using CapCut TTS API.
+    Downloads MP3 files into a temporary folder.
+    Returns: (list of dicts [{'path', 'start_us'}], temp_dir_path)
+    """
+    blocks = parse_srt_blocks(srt_path)
+    if not blocks:
+        log("  [TTS] Không tìm thấy đoạn phụ đề nào để tạo giọng đọc.")
+        return [], ""
+
+    temp_dir = tempfile.mkdtemp(prefix="bilicut_tts_")
+    log(f"  [CapCut TTS] Đang tạo giọng đọc '{voice_type}' cho {len(blocks)} câu phụ đề...")
+    client = CapCutClient()
+    audio_items = []
+
+    for i, block in enumerate(blocks, start=1):
+        check_cancelled(cancel_event)
+        text = block['text']
+        start_us = block['start_ms'] * 1000
+        preview_text = text.replace('\n', ' ')
+        if len(preview_text) > 30:
+            preview_text = preview_text[:30] + "..."
+        log(f"  [CapCut TTS {i}/{len(blocks)}] Đọc: \"{preview_text}\"")
+
+        try:
+            res = client.generate_speech(text, voice=voice_type, wait=True)
+            check_cancelled(cancel_event)
+            url, _ = extract_audio_url_and_duration(res)
+            if not url:
+                log(f"  [CapCut TTS {i}] Bỏ qua câu do không nhận được kết quả audio.")
+                continue
+
+            mp3_path = os.path.join(temp_dir, f"tts_{i:04d}.mp3")
+            urllib.request.urlretrieve(url, mp3_path)
+            audio_items.append({
+                "path": mp3_path,
+                "start_us": start_us,
+            })
+        except PipelineCancelledException:
+            shutil.rmtree(temp_dir, ignore_errors=True)
+            raise
+        except Exception as exc:
+            log(f"  [CapCut TTS {i}] Lỗi tạo giọng đọc câu này: {exc}")
+
+    log(f"  [CapCut TTS] Hoàn tất tạo {len(audio_items)} đoạn âm thanh.")
+    return audio_items, temp_dir
+
+
+# ──────────────────────────────────────
+# STEP 6 – Create CapCut draft
 # ──────────────────────────────────────
 
 def create_capcut_draft(
@@ -224,6 +358,7 @@ def create_capcut_draft(
     draft_name: str,
     video_info: dict,
     capcut_draft_dir: str,
+    tts_audio_items: list[dict] = None,
     log=print,
 ) -> str:
     if not os.path.isdir(capcut_draft_dir):
@@ -245,6 +380,9 @@ def create_capcut_draft(
         fps=video_info["fps"],
         allow_replace=True,
     )
+
+    draft_path = os.path.join(capcut_draft_dir, draft_name)
+    permanent_tts_dir = os.path.join(draft_path, "tts_audio")
 
     log("  [CapCut] Adding video track...")
     script.add_track(TrackType.video)
@@ -273,8 +411,40 @@ def create_capcut_draft(
         text_style=style,
     )
 
+    # Chèn các đoạn audio giọng đọc TTS vào audio track nếu có
+    if tts_audio_items:
+        os.makedirs(permanent_tts_dir, exist_ok=True)
+        log(f"  [CapCut] Chèn {len(tts_audio_items)} đoạn giọng đọc TTS vào audio track...")
+        script.add_track(TrackType.audio, track_name="tts_speech")
+        last_end_us = 0
+        inserted_count = 0
+        for i, item in enumerate(tts_audio_items, start=1):
+            src_path = item["path"]
+            start_us = item["start_us"]
+            if os.path.exists(src_path):
+                try:
+                    # Copy MP3 file vĩnh viễn vào trong thư mục CapCut Draft
+                    dst_path = os.path.join(permanent_tts_dir, f"speech_{i:04d}.mp3")
+                    shutil.copy2(src_path, dst_path)
+
+                    audio_mat = AudioMaterial(dst_path)
+                    # Tránh chồng chéo (overlap): nếu thời gian bắt đầu nhỏ hơn thời điểm kết thúc câu trước, nối tiếp câu trước
+                    if start_us < last_end_us:
+                        start_us = last_end_us
+
+                    audio_seg = AudioSegment(
+                        material=audio_mat,
+                        target_timerange=Timerange(start=start_us, duration=audio_mat.duration)
+                    )
+                    script.add_segment(audio_seg, track_name="tts_speech")
+                    last_end_us = start_us + audio_mat.duration
+                    inserted_count += 1
+                except Exception as e:
+                    log(f"  [CapCut Audio Warning] Không thể chèn audio {src_path}: {e}")
+
+        log(f"  [CapCut] Đã chèn thành công {inserted_count}/{len(tts_audio_items)} đoạn âm thanh vào timeline.")
+
     script.save()
-    draft_path = os.path.join(capcut_draft_dir, draft_name)
     log(f"  [CapCut] Draft saved: {draft_path}")
     return draft_path
 
@@ -291,7 +461,10 @@ def run_pipeline(
     n_threads: int = 8,
     enable_translation: bool = False,
     gemini_api_key: str = "",
+    enable_tts: bool = False,
+    tts_voice: str = "BV421_vivn_streaming",
     log=print,
+    cancel_event=None,
 ) -> str:
     log("=" * 52)
     log("  BiliCut  -  Video > SRT > CapCut Draft")
@@ -310,23 +483,31 @@ def run_pipeline(
     tmp_vi.close()
     srt_vi = tmp_vi.name
 
+    temp_tts_dir = None
+
     try:
+        check_cancelled(cancel_event)
+
         # 1. Video info
-        log(f"\n[1/5] Reading video info: {os.path.basename(video_path)}")
+        log(f"\n[1/6] Reading video info: {os.path.basename(video_path)}")
         vinfo = get_video_info(video_path)
         log(f"  {vinfo['width']}x{vinfo['height']} @ {vinfo['fps']}fps  "
             f"| {vinfo['duration_us']/1e6:.1f}s")
 
+        check_cancelled(cancel_event)
+
         # 2. Extract audio
-        log("\n[2/5] Extracting audio (FFmpeg)...")
+        log("\n[2/6] Extracting audio (FFmpeg)...")
         with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
             wav_path = tmp.name
         try:
             extract_audio_wav(video_path, wav_path)
             log(f"  Temp WAV: {wav_path}")
 
+            check_cancelled(cancel_event)
+
             # 3. Transcribe
-            log("\n[3/5] Transcribing (Whisper)...")
+            log("\n[3/6] Transcribing (Whisper)...")
             transcribe_to_srt(
                 wav_path=wav_path,
                 srt_path=srt_orig,
@@ -339,10 +520,12 @@ def run_pipeline(
             if os.path.exists(wav_path):
                 os.remove(wav_path)
 
+        check_cancelled(cancel_event)
+
         # 4. Gemini Translation (Optional)
         srt_to_use = srt_orig
         if enable_translation:
-            log("\n[4/5] Translating SRT to Vietnamese via Gemini API...")
+            log("\n[4/6] Translating SRT to Vietnamese via Gemini API...")
             srt_to_use = translate_srt_gemini(
                 srt_path=srt_orig,
                 output_srt_path=srt_vi,
@@ -350,16 +533,34 @@ def run_pipeline(
                 log=log,
             )
         else:
-            log("\n[4/5] Translation disabled, using original SRT.")
+            log("\n[4/6] Translation disabled, using original SRT.")
 
-        # 5. CapCut draft
-        log("\n[5/5] Creating CapCut draft...")
+        check_cancelled(cancel_event)
+
+        # 5. CapCut TTS Speech (Optional)
+        tts_audio_items = []
+        if enable_tts:
+            log("\n[5/6] Generating CapCut TTS Speech from SRT...")
+            tts_audio_items, temp_tts_dir = generate_tts_audio_segments(
+                srt_path=srt_to_use,
+                voice_type=tts_voice,
+                log=log,
+                cancel_event=cancel_event,
+            )
+        else:
+            log("\n[5/6] CapCut TTS Speech disabled.")
+
+        check_cancelled(cancel_event)
+
+        # 6. CapCut draft
+        log("\n[6/6] Creating CapCut draft...")
         draft_path = create_capcut_draft(
             video_path=video_path,
             srt_path=srt_to_use,
             draft_name=draft_name,
             video_info=vinfo,
             capcut_draft_dir=capcut_draft_dir,
+            tts_audio_items=tts_audio_items,
             log=log,
         )
 
@@ -371,7 +572,9 @@ def run_pipeline(
         return draft_path
 
     finally:
-        # Tự động xóa file SRT tạm thời sau khi hoàn tất
+        # Tự động xóa các thư mục và file tạm
+        if temp_tts_dir and os.path.exists(temp_tts_dir):
+            shutil.rmtree(temp_tts_dir, ignore_errors=True)
         for tmp_file in [srt_orig, srt_vi]:
             if os.path.exists(tmp_file):
                 try:
