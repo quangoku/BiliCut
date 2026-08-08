@@ -18,7 +18,6 @@ from pycapcut import (
 # PATHS
 # ──────────────────────────────────────
 BASE_DIR   = os.path.dirname(os.path.abspath(__file__))
-OUTPUT_DIR = os.path.join(BASE_DIR, "output")
 MODELS_DIR = os.path.join(BASE_DIR, "models")
 FFMPEG_BIN = os.path.join(BASE_DIR, "ffmpeg.exe")
 
@@ -133,8 +132,90 @@ def get_video_info(video_path: str) -> dict:
     return {"width": width, "height": height, "duration_us": dur_us, "fps": fps}
 
 
+import json
+import urllib.request
+import urllib.error
+
 # ──────────────────────────────────────
-# STEP 4 – Create CapCut draft
+# STEP 4 – Translate SRT (Gemini API)
+# ──────────────────────────────────────
+
+def translate_srt_gemini(
+    srt_path: str,
+    output_srt_path: str,
+    api_key: str,
+    log=print,
+) -> str:
+    """Translate SRT subtitles to Vietnamese using Gemini REST API."""
+    api_key = api_key.strip()
+    if not api_key:
+        raise ValueError("Vui lòng nhập Gemini API Key để thực hiện dịch!")
+
+    if not os.path.exists(srt_path):
+        raise FileNotFoundError(f"Không tìm thấy file SRT: {srt_path}")
+
+    with open(srt_path, "r", encoding="utf-8") as f:
+        content = f.read().strip()
+
+    if not content:
+        raise ValueError("File SRT trống, không thể dịch.")
+
+    log("  [Gemini] Đang gửi nội dung SRT lên Gemini API để dịch sang tiếng Việt...")
+
+    prompt = (
+        "Bạn là một biên dịch viên phụ đề chuyên nghiệp.\n"
+        "Hãy dịch toàn bộ nội dung phụ đề SRT sau đây sang tiếng Việt tự nhiên và chuẩn xác.\n"
+        "QUY TẮC BẮT BUỘC:\n"
+        "1. Giữ NGUYÊN cấu trúc file SRT, số thứ tự (1, 2, 3...) và timestamp (00:00:00,000 --> 00:00:00,000).\n"
+        "2. CHỈ dịch phần câu nói văn bản của từng phụ đề.\n"
+        "3. KHÔNG thêm bất kỳ ghi chú, nhận xét hay định dạng markdown codeblock nào (không dùng ```srt hoặc ```).\n\n"
+        f"Nội dung SRT:\n{content}"
+    )
+
+    models_to_try = ["gemini-2.5-flash", "gemini-1.5-flash", "gemini-2.0-flash"]
+    translated_text = None
+    last_error = None
+
+    for m in models_to_try:
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/{m}:generateContent?key={api_key}"
+        payload = json.dumps({"contents": [{"parts": [{"text": prompt}]}]}).encode("utf-8")
+        req = urllib.request.Request(
+            url, data=payload, headers={"Content-Type": "application/json"}, method="POST"
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=60) as resp:
+                data = json.loads(resp.read().decode("utf-8"))
+                translated_text = data["candidates"][0]["content"]["parts"][0]["text"].strip()
+                log(f"  [Gemini] Dịch thành công với model {m}")
+                break
+        except urllib.error.HTTPError as err:
+            err_body = err.read().decode("utf-8", errors="ignore")
+            last_error = f"HTTP {err.code}: {err_body}"
+        except Exception as err:
+            last_error = str(err)
+
+    if not translated_text:
+        raise RuntimeError(f"Lỗi gọi Gemini API: {last_error}")
+
+    # Xóa định dạng markdown ``` nếu Gemini lỡ thêm vào
+    if translated_text.startswith("```"):
+        lines = translated_text.splitlines()
+        if lines[0].startswith("```"):
+            lines = lines[1:]
+        if lines and lines[-1].startswith("```"):
+            lines = lines[:-1]
+        translated_text = "\n".join(lines).strip()
+
+    os.makedirs(os.path.dirname(output_srt_path), exist_ok=True)
+    with open(output_srt_path, "w", encoding="utf-8") as f:
+        f.write(translated_text + "\n")
+
+    log(f"  [Gemini] File SRT tiếng Việt đã lưu tại: {output_srt_path}")
+    return output_srt_path
+
+
+# ──────────────────────────────────────
+# STEP 5 – Create CapCut draft
 # ──────────────────────────────────────
 
 def create_capcut_draft(
@@ -208,6 +289,8 @@ def run_pipeline(
     model_name: str = "small",
     language=None,
     n_threads: int = 8,
+    enable_translation: bool = False,
+    gemini_api_key: str = "",
     log=print,
 ) -> str:
     log("=" * 52)
@@ -216,55 +299,85 @@ def run_pipeline(
 
     base       = os.path.splitext(os.path.basename(video_path))[0]
     ts         = datetime.now().strftime("%Y%m%d_%H%M%S")
-    srt_path   = os.path.join(OUTPUT_DIR, f"{base}.srt")
     draft_name = f"{base}_{ts}"
 
-    # 1. Video info
-    log(f"\n[1/4] Reading video info: {os.path.basename(video_path)}")
-    vinfo = get_video_info(video_path)
-    log(f"  {vinfo['width']}x{vinfo['height']} @ {vinfo['fps']}fps  "
-        f"| {vinfo['duration_us']/1e6:.1f}s")
+    # Tạo các file SRT tạm thời, tự động dọn dẹp sau khi import xong vào CapCut
+    tmp_orig = tempfile.NamedTemporaryFile(suffix="_orig.srt", delete=False)
+    tmp_orig.close()
+    srt_orig = tmp_orig.name
 
-    # 2. Extract audio
-    log("\n[2/4] Extracting audio (FFmpeg)...")
-    with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
-        wav_path = tmp.name
+    tmp_vi = tempfile.NamedTemporaryFile(suffix="_vi.srt", delete=False)
+    tmp_vi.close()
+    srt_vi = tmp_vi.name
+
     try:
-        extract_audio_wav(video_path, wav_path)
-        log(f"  Temp WAV: {wav_path}")
+        # 1. Video info
+        log(f"\n[1/5] Reading video info: {os.path.basename(video_path)}")
+        vinfo = get_video_info(video_path)
+        log(f"  {vinfo['width']}x{vinfo['height']} @ {vinfo['fps']}fps  "
+            f"| {vinfo['duration_us']/1e6:.1f}s")
 
-        # 3. Transcribe
-        log("\n[3/4] Transcribing (Whisper)...")
-        transcribe_to_srt(
-            wav_path=wav_path,
-            srt_path=srt_path,
-            model_name=model_name,
-            language=language,
-            n_threads=n_threads,
+        # 2. Extract audio
+        log("\n[2/5] Extracting audio (FFmpeg)...")
+        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
+            wav_path = tmp.name
+        try:
+            extract_audio_wav(video_path, wav_path)
+            log(f"  Temp WAV: {wav_path}")
+
+            # 3. Transcribe
+            log("\n[3/5] Transcribing (Whisper)...")
+            transcribe_to_srt(
+                wav_path=wav_path,
+                srt_path=srt_orig,
+                model_name=model_name,
+                language=language,
+                n_threads=n_threads,
+                log=log,
+            )
+        finally:
+            if os.path.exists(wav_path):
+                os.remove(wav_path)
+
+        # 4. Gemini Translation (Optional)
+        srt_to_use = srt_orig
+        if enable_translation:
+            log("\n[4/5] Translating SRT to Vietnamese via Gemini API...")
+            srt_to_use = translate_srt_gemini(
+                srt_path=srt_orig,
+                output_srt_path=srt_vi,
+                api_key=gemini_api_key,
+                log=log,
+            )
+        else:
+            log("\n[4/5] Translation disabled, using original SRT.")
+
+        # 5. CapCut draft
+        log("\n[5/5] Creating CapCut draft...")
+        draft_path = create_capcut_draft(
+            video_path=video_path,
+            srt_path=srt_to_use,
+            draft_name=draft_name,
+            video_info=vinfo,
+            capcut_draft_dir=capcut_draft_dir,
             log=log,
         )
+
+        log("\n" + "=" * 52)
+        log("  DONE!")
+        log(f"  Draft: {draft_path}")
+        log("  -> Open CapCut - your new draft is ready.")
+        log("=" * 52)
+        return draft_path
+
     finally:
-        if os.path.exists(wav_path):
-            os.remove(wav_path)
-
-    # 4. CapCut draft
-    log("\n[4/4] Creating CapCut draft...")
-    draft_path = create_capcut_draft(
-        video_path=video_path,
-        srt_path=srt_path,
-        draft_name=draft_name,
-        video_info=vinfo,
-        capcut_draft_dir=capcut_draft_dir,
-        log=log,
-    )
-
-    log("\n" + "=" * 52)
-    log("  DONE!")
-    log(f"  SRT  : {srt_path}")
-    log(f"  Draft: {draft_path}")
-    log("  -> Open CapCut - your new draft is ready.")
-    log("=" * 52)
-    return draft_path
+        # Tự động xóa file SRT tạm thời sau khi hoàn tất
+        for tmp_file in [srt_orig, srt_vi]:
+            if os.path.exists(tmp_file):
+                try:
+                    os.remove(tmp_file)
+                except Exception:
+                    pass
 
 
 # ──────────────────────────────────────

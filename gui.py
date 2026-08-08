@@ -19,8 +19,10 @@ DEFAULT_SETTINGS = {
         os.environ.get("LOCALAPPDATA", ""),
         "CapCut", "UserData", "Projects", "com.lveditor.draft"
     ),
-    "model":    "small",
-    "language": "Auto detect",
+    "model":              "small",
+    "language":           "Auto detect",
+    "enable_translation": False,
+    "gemini_api_key":     "",
 }
 
 
@@ -132,8 +134,8 @@ class BiliCutApp:
         self.root.title("BiliCut  -  Video > SRT > CapCut")
         self.root.configure(bg=BG)
         self.root.resizable(True, True)
-        self.root.minsize(640, 480)
-        w, h = 740, 560
+        self.root.minsize(660, 560)
+        w, h = 760, 660
         sw, sh = self.root.winfo_screenwidth(), self.root.winfo_screenheight()
         self.root.geometry(f"{w}x{h}+{(sw-w)//2}+{(sh-h)//2}")
 
@@ -149,16 +151,29 @@ class BiliCutApp:
 
     # ── build UI ───────────────────────────
     def _build_ui(self):
+        # ── scroll canvas ──
+        c = tk.Canvas(self.root, bg=BG, highlightthickness=0)
+        sb = tk.Scrollbar(self.root, orient="vertical", command=c.yview)
+        c.configure(yscrollcommand=sb.set)
+        sb.pack(side="right", fill="y")
+        c.pack(side="left", fill="both", expand=True)
+
+        inner = tk.Frame(c, bg=BG)
+        win = c.create_window((0, 0), window=inner, anchor="nw")
+        inner.bind("<Configure>", lambda _: c.configure(scrollregion=c.bbox("all")))
+        c.bind("<Configure>", lambda e: c.itemconfig(win, width=e.width))
+        c.bind_all("<MouseWheel>", lambda e: c.yview_scroll(int(-e.delta/120), "units"))
+
         # ── header ──
-        hdr = tk.Frame(self.root, bg=SURFACE, pady=12)
+        hdr = tk.Frame(inner, bg=SURFACE, pady=12)
         hdr.pack(fill="x")
         tk.Label(hdr, text="BiliCut", fg=TEXT,
                  bg=SURFACE, font=("Segoe UI Semibold", 16)).pack(side="left", padx=20)
         tk.Label(hdr, text="Video  >  SRT  >  CapCut Draft",
                  fg=DIM, bg=SURFACE, font=SANS).pack(side="left")
-        tk.Frame(self.root, bg=BORDER, height=1).pack(fill="x")
+        tk.Frame(inner, bg=BORDER, height=1).pack(fill="x")
 
-        body = tk.Frame(self.root, bg=BG, padx=18, pady=16)
+        body = tk.Frame(inner, bg=BG, padx=18, pady=16)
         body.pack(fill="both", expand=True)
 
         # ── video file ──
@@ -197,6 +212,31 @@ class BiliCutApp:
                      style="D.TCombobox", font=SANS,
                      width=16).pack(fill="x", ipady=4)
 
+        # ── Gemini Translation ──
+        gf = make_lf(body, "🤖  Gemini Translation (SRT → Tiếng Việt)")
+        gf.pack(fill="x", pady=(0, 10))
+
+        row_g1 = tk.Frame(gf, bg=SURFACE)
+        row_g1.pack(fill="x", pady=(0, 6))
+        self.var_translate = tk.BooleanVar(value=False)
+        chk_trans = tk.Checkbutton(
+            row_g1, text="Dịch phụ đề SRT sang tiếng Việt (bằng Gemini API)",
+            variable=self.var_translate, bg=SURFACE, fg=TEXT,
+            selectcolor=SURFACE2, activebackground=SURFACE,
+            activeforeground=TEXT, font=SANS, cursor="hand2",
+            command=self._toggle_translation,
+        )
+        chk_trans.pack(side="left")
+
+        self.row_g2 = tk.Frame(gf, bg=SURFACE)
+        self.row_g2.pack(fill="x")
+        tk.Label(self.row_g2, text="Gemini API Key:", fg=TEXT, bg=SURFACE, font=SANS).pack(side="left", padx=(0, 8))
+        self.var_gemini_key = tk.StringVar()
+        e_key = tk.Entry(self.row_g2, textvariable=self.var_gemini_key, bg=SURFACE2, fg=TEXT,
+                         insertbackground=TEXT, relief="flat", font=SANS, bd=0, show="*",
+                         highlightthickness=1, highlightbackground=BORDER, highlightcolor=ACCENT)
+        e_key.pack(side="left", fill="x", expand=True, ipady=4)
+
         # ── start button ──
         self.btn = make_btn(body, "Start Pipeline", self._start)
         self.btn.pack(fill="x", pady=(6, 8), ipady=6)
@@ -226,6 +266,16 @@ class BiliCutApp:
         self.var_draft.set(self.cfg.get("capcut_draft_dir", ""))
         self.var_model.set(self.cfg.get("model", "small"))
         self.var_lang.set(self.cfg.get("language", "Auto detect"))
+        self.var_translate.set(self.cfg.get("enable_translation", False))
+        self.var_gemini_key.set(self.cfg.get("gemini_api_key", ""))
+        self._toggle_translation()
+
+    # ── translation toggle ───────────
+    def _toggle_translation(self):
+        st = "normal" if self.var_translate.get() else "disabled"
+        for w in self.row_g2.winfo_children():
+            try: w.config(state=st)
+            except Exception: pass
 
     # ── auto-save draft folder ──────────────
     def _on_draft_changed(self, *_):
@@ -248,8 +298,8 @@ class BiliCutApp:
     def _log_fn(self, *args, **_):
         msg = " ".join(str(a) for a in args)
         low = msg.lower()
-        tag = ("ok"  if "done" in low else
-               "err" if "error" in low or "not found" in low else
+        tag = ("ok"  if "done" in low or "thành công" in low else
+               "err" if "error" in low or "lỗi" in low or "not found" in low else
                "acc" if msg.startswith("[") or "===" in msg else "")
         self._write_log(msg, tag)
 
@@ -265,11 +315,13 @@ class BiliCutApp:
 
     # ── start ───────────────────────────────
     def _start(self):
-        video     = self.var_video.get().strip()
-        draft_dir = self.var_draft.get().strip()
-        model     = self.var_model.get()
-        lang_lbl  = self.var_lang.get()
-        lang      = self.lang_codes[self.lang_labels.index(lang_lbl)]
+        video        = self.var_video.get().strip()
+        draft_dir    = self.var_draft.get().strip()
+        model        = self.var_model.get()
+        lang_lbl     = self.var_lang.get()
+        lang         = self.lang_codes[self.lang_labels.index(lang_lbl)]
+        enable_trans = self.var_translate.get()
+        gemini_key   = self.var_gemini_key.get().strip()
 
         if not video:
             messagebox.showerror("Missing", "Please select a video file!"); return
@@ -277,9 +329,16 @@ class BiliCutApp:
             messagebox.showerror("Not found", f"File not found:\n{video}"); return
         if not draft_dir:
             messagebox.showerror("Missing", "Please select the CapCut draft folder!"); return
+        if enable_trans and not gemini_key:
+            messagebox.showerror("Missing", "Vui lòng nhập Gemini API Key để dịch sang tiếng Việt!"); return
 
-        # Save model/language preference
-        self.cfg.update({"model": model, "language": lang_lbl})
+        # Save model/language/translation preference
+        self.cfg.update({
+            "model":              model,
+            "language":           lang_lbl,
+            "enable_translation": enable_trans,
+            "gemini_api_key":     gemini_key,
+        })
         save_settings(self.cfg)
 
         # Clear log
@@ -298,6 +357,8 @@ class BiliCutApp:
                     model_name=model,
                     language=lang,
                     n_threads=8,
+                    enable_translation=enable_trans,
+                    gemini_api_key=gemini_key,
                     log=self._log_fn,
                 )
                 self.root.after(0, lambda: messagebox.showinfo(
