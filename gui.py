@@ -259,13 +259,12 @@ class BiliCutApp:
     def _setup_window(self):
         self.root.title("BiliCut — Tạo phụ đề và draft CapCut")
         self.root.configure(bg=BG)
-        icon_path = resource_path("assets", "icon.png")
+        icon_path = resource_path("assets", "icon.ico")
         if os.path.isfile(icon_path):
             try:
-                self._app_icon = tk.PhotoImage(file=icon_path)
-                self.root.iconphoto(True, self._app_icon)
+                self.root.iconbitmap(icon_path)
             except tk.TclError:
-                self._app_icon = None
+                pass
         self.root.resizable(True, True)
         self.root.minsize(720, 640)
         w, h = 820, 760
