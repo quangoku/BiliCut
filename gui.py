@@ -621,8 +621,10 @@ class BiliCutApp:
 
     # ── toggles ───────────
     def _model_is_installed(self, model=None):
+        from main import MODELS_DIR
+
         model = model or self.var_model.get()
-        return os.path.exists(os.path.join(BASE_DIR, "models", f"ggml-{model}.bin"))
+        return os.path.isfile(os.path.join(MODELS_DIR, f"ggml-{model}.bin"))
 
     def _refresh_model_status(self, *_):
         if self._model_is_installed():
