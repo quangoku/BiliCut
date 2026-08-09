@@ -121,6 +121,33 @@ SANS     = ("Segoe UI", 10)
 SANS_B   = ("Segoe UI Semibold", 11)
 
 MODELS = ["tiny", "base", "small", "medium", "large"]
+MODEL_INFO = {
+    "tiny": {
+        "size": "~75 MB",
+        "memory": "~390 MB RAM",
+        "summary": "Nhanh nhất · độ chính xác cơ bản",
+    },
+    "base": {
+        "size": "~142 MB",
+        "memory": "~500 MB RAM",
+        "summary": "Nhanh · chính xác hơn tiny",
+    },
+    "small": {
+        "size": "~466 MB",
+        "memory": "~1 GB RAM",
+        "summary": "Cân bằng tốc độ và độ chính xác · khuyên dùng",
+    },
+    "medium": {
+        "size": "~1.5 GB",
+        "memory": "~2.6 GB RAM",
+        "summary": "Chính xác cao · xử lý chậm hơn",
+    },
+    "large": {
+        "size": "~2.9 GB",
+        "memory": "~4.7 GB RAM",
+        "summary": "Chính xác cao nhất · cần máy mạnh",
+    },
+}
 LANGUAGES = [
     ("Tiếng Trung", "zh"),
     ("Tiếng Anh", "en"),
@@ -364,6 +391,11 @@ class BiliCutApp:
         )
         self.model_combo.pack(fill="x", ipady=4)
         self.model_combo.bind("<<ComboboxSelected>>", self._refresh_model_status)
+        self.model_info_lbl = tk.Label(
+            mf, text="", bg=SURFACE, fg=DIM, font=("Segoe UI", 8),
+            justify="left", anchor="w", wraplength=245,
+        )
+        self.model_info_lbl.pack(fill="x", anchor="w", pady=(5, 0))
         self.model_status_lbl = tk.Label(
             mf, text="", bg=SURFACE, fg=MUTED, font=("Segoe UI", 8),
         )
@@ -642,6 +674,15 @@ class BiliCutApp:
         return os.path.isfile(os.path.join(MODELS_DIR, f"ggml-{model}.bin"))
 
     def _refresh_model_status(self, *_):
+        model = self.var_model.get()
+        info = MODEL_INFO.get(model, {})
+        self.model_info_lbl.config(
+            text=(
+                f"Dung lượng tải: {info.get('size', 'Không rõ')} · "
+                f"Bộ nhớ: {info.get('memory', 'Không rõ')}\n"
+                f"{info.get('summary', '')}"
+            )
+        )
         if self._model_is_installed():
             self.model_status_lbl.config(text="Đã cài đặt · sẵn sàng sử dụng", fg=SUCCESS)
         else:
