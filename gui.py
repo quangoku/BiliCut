@@ -12,8 +12,14 @@ from tkinter import colorchooser, filedialog, ttk, messagebox
 # ──────────────────────────────────────────────
 # PERSISTENT SETTINGS
 # ──────────────────────────────────────────────
-BASE_DIR      = os.path.dirname(os.path.abspath(__file__))
-SETTINGS_FILE = os.path.join(BASE_DIR, ".bilicut_settings.json")
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+LOCAL_APP_DATA = os.environ.get(
+    "LOCALAPPDATA",
+    os.path.join(os.path.expanduser("~"), "AppData", "Local"),
+)
+APP_DATA_DIR = os.path.join(LOCAL_APP_DATA, "BiliCut")
+SETTINGS_FILE = os.path.join(APP_DATA_DIR, ".bilicut_settings.json")
+LEGACY_SETTINGS_FILE = os.path.join(BASE_DIR, ".bilicut_settings.json")
 
 
 def resource_path(*parts) -> str:
@@ -71,15 +77,25 @@ DEFAULT_SETTINGS = {
 
 
 def load_settings() -> dict:
+    settings_path = SETTINGS_FILE
+    if not os.path.isfile(settings_path) and os.path.isfile(LEGACY_SETTINGS_FILE):
+        settings_path = LEGACY_SETTINGS_FILE
+
     try:
-        with open(SETTINGS_FILE, "r", encoding="utf-8") as f:
-            return {**DEFAULT_SETTINGS, **json.load(f)}
+        with open(settings_path, "r", encoding="utf-8") as f:
+            settings = {**DEFAULT_SETTINGS, **json.load(f)}
+
+        # Migrate settings created by older versions beside the executable.
+        if settings_path == LEGACY_SETTINGS_FILE:
+            save_settings(settings)
+        return settings
     except Exception:
         return dict(DEFAULT_SETTINGS)
 
 
 def save_settings(cfg: dict) -> None:
     try:
+        os.makedirs(APP_DATA_DIR, exist_ok=True)
         with open(SETTINGS_FILE, "w", encoding="utf-8") as f:
             json.dump(cfg, f, ensure_ascii=False, indent=2)
     except Exception:
