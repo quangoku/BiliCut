@@ -17,9 +17,18 @@ from pycapcut import (
 # ──────────────────────────────────────
 # PATHS & CANCELLATION
 # ──────────────────────────────────────
-BASE_DIR   = os.path.dirname(os.path.abspath(__file__))
-MODELS_DIR = os.path.join(BASE_DIR, "models")
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+LOCAL_APP_DATA = os.environ.get(
+    "LOCALAPPDATA",
+    os.path.join(os.path.expanduser("~"), "AppData", "Local"),
+)
+APP_DATA_DIR = os.path.join(LOCAL_APP_DATA, "BiliCut")
+MODELS_DIR = os.path.join(APP_DATA_DIR, "models")
 FFMPEG_BIN = os.path.join(BASE_DIR, "ffmpeg.exe")
+
+# Whisper models are user data. Keep them outside the installation directory so
+# downloaded models remain writable and survive application updates.
+os.makedirs(MODELS_DIR, exist_ok=True)
 
 
 class PipelineCancelledException(Exception):
