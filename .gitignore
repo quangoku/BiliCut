@@ -7,3 +7,4 @@ ffprobe.exe
 /build
 /dist
 *.spec
+/release
