@@ -13,6 +13,7 @@ from pycapcut import (
     DraftFolder, VideoMaterial, VideoSegment,
     Timerange, TrackType, TextStyle,
 )
+from ffmpeg_manager import ensure_ffmpeg_installed
 
 # ──────────────────────────────────────
 # PATHS & CANCELLATION
@@ -24,7 +25,6 @@ LOCAL_APP_DATA = os.environ.get(
 )
 APP_DATA_DIR = os.path.join(LOCAL_APP_DATA, "BiliCut")
 MODELS_DIR = os.path.join(APP_DATA_DIR, "models")
-FFMPEG_BIN = os.path.join(BASE_DIR, "ffmpeg.exe")
 
 # Whisper models are user data. Keep them outside the installation directory so
 # downloaded models remain writable and survive application updates.
@@ -46,11 +46,10 @@ def check_cancelled(cancel_event=None):
 # STEP 1 – Extract audio (FFmpeg)
 # ──────────────────────────────────────
 
-def extract_audio_wav(video_path: str, wav_path: str) -> None:
+def extract_audio_wav(video_path: str, wav_path: str, ffmpeg_path: str) -> None:
     """Extract 16kHz mono WAV from video using FFmpeg."""
-    ffmpeg = FFMPEG_BIN if os.path.exists(FFMPEG_BIN) else "ffmpeg"
     cmd = [
-        ffmpeg, "-y", "-i", video_path,
+        ffmpeg_path, "-y", "-i", video_path,
         "-ar", "16000", "-ac", "1", "-c:a", "pcm_s16le",
         wav_path,
     ]
@@ -119,14 +118,10 @@ def transcribe_to_srt(
 # STEP 3 – Get video info (FFprobe)
 # ──────────────────────────────────────
 
-def get_video_info(video_path: str) -> dict:
+def get_video_info(video_path: str, ffprobe_path: str) -> dict:
     """Return dict with width, height, fps, duration_us."""
-    ffprobe = os.path.join(BASE_DIR, "ffprobe.exe")
-    if not os.path.exists(ffprobe):
-        ffprobe = "ffprobe"
-
     cmd = [
-        ffprobe, "-v", "error",
+        ffprobe_path, "-v", "error",
         "-select_streams", "v:0",
         "-show_entries", "stream=width,height,r_frame_rate",
         "-show_entries", "format=duration",
@@ -667,9 +662,17 @@ def run_pipeline(
     try:
         check_cancelled(cancel_event)
 
+        # FFmpeg is a required runtime dependency. Download it once to the
+        # current user's LocalAppData directory and reuse it on later runs.
+        log("\n[Setup] Checking FFmpeg runtime...")
+        ffmpeg_path, ffprobe_path = ensure_ffmpeg_installed(
+            log=log,
+            cancel_check=lambda: check_cancelled(cancel_event),
+        )
+
         # 1. Video info
         log(f"\n[1/6] Reading video info: {os.path.basename(video_path)}")
-        vinfo = get_video_info(video_path)
+        vinfo = get_video_info(video_path, ffprobe_path)
         source_size = (vinfo["width"], vinfo["height"])
         if aspect_ratio == "9:16":
             vinfo["width"], vinfo["height"] = 1080, 1920
@@ -688,7 +691,7 @@ def run_pipeline(
         with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
             wav_path = tmp.name
         try:
-            extract_audio_wav(video_path, wav_path)
+            extract_audio_wav(video_path, wav_path, ffmpeg_path)
             log(f"  Temp WAV: {wav_path}")
 
             check_cancelled(cancel_event)

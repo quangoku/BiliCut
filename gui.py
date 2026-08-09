@@ -338,7 +338,18 @@ class BiliCutApp:
         win = c.create_window((0, 0), window=inner, anchor="nw")
         inner.bind("<Configure>", lambda _: c.configure(scrollregion=c.bbox("all")))
         c.bind("<Configure>", lambda e: c.itemconfig(win, width=e.width))
-        c.bind_all("<MouseWheel>", lambda e: c.yview_scroll(int(-e.delta/120), "units"))
+        def scroll_page(event):
+            units = int(-event.delta / 120)
+            if units:
+                c.yview_scroll(units, "units")
+            return "break"
+
+        c.bind_all("<MouseWheel>", scroll_page)
+
+        # ttk.Combobox changes its selected value on mouse-wheel by default.
+        # Route the wheel to the page instead; the opened popdown list uses a
+        # separate Listbox widget and therefore remains normally scrollable.
+        self.root.bind_class("TCombobox", "<MouseWheel>", scroll_page)
 
         # ── header ──
         hdr = tk.Frame(inner, bg=SURFACE, pady=14)

@@ -6,4 +6,5 @@ ffprobe.exe
 /build
 /dist
 *.spec
+!BiliCut.spec
 /release
