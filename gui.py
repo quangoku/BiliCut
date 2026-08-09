@@ -257,7 +257,7 @@ class BiliCutApp:
 
     # ── window ──────────────────────────────
     def _setup_window(self):
-        self.root.title("BiliCut — Tạo phụ đề và draft CapCut")
+        self.root.title("BiliCut")
         self.root.configure(bg=BG)
         icon_path = resource_path("assets", "icon.ico")
         if os.path.isfile(icon_path):
