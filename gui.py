@@ -5,7 +5,21 @@ BiliCut GUI – Dark-themed Tkinter interface with persistent settings
 import os
 import json
 import sys
+import traceback
 import threading
+
+# PyInstaller windowed executables do not have a console, so stdout/stderr are
+# None. Some dependencies (notably tqdm used by pywhispercpp model downloads)
+# expect real writable streams during import and initialization.
+_stdout_fallback = None
+_stderr_fallback = None
+if sys.stdout is None:
+    _stdout_fallback = open(os.devnull, "w", encoding="utf-8")
+    sys.stdout = _stdout_fallback
+if sys.stderr is None:
+    _stderr_fallback = open(os.devnull, "w", encoding="utf-8")
+    sys.stderr = _stderr_fallback
+
 import tkinter as tk
 from tkinter import colorchooser, filedialog, ttk, messagebox
 
@@ -963,6 +977,7 @@ class BiliCutApp:
                 self.root.after(0, lambda: messagebox.showinfo("Đã hủy", "Tiến trình đã được hủy."))
             except Exception as e:
                 msg = str(e)
+                self._log_fn(traceback.format_exc(), "err")
                 self._log_fn(f"[ERROR] {msg}")
                 self.root.after(0, lambda: messagebox.showerror("Có lỗi xảy ra", msg))
             finally:
