@@ -6,6 +6,10 @@ import os
 import builtins
 import tempfile
 import subprocess
+import time
+import threading
+import re
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 
 from pywhispercpp.model import Model
@@ -153,8 +157,180 @@ def get_video_info(video_path: str, ffprobe_path: str) -> dict:
 
 
 import json
+import socket
 import urllib.request
 import urllib.error
+
+# Stable text models, ordered by translation quality and then cost/speed.
+# Preview/experimental aliases are intentionally avoided because they can be
+# retired while an installed build is still in use.
+GEMINI_TRANSLATION_MODELS = (
+    "gemini-3.6-flash",
+    "gemini-3.5-flash-lite",
+)
+GEMINI_CHUNK_SIZE = 60
+GEMINI_MAX_WORKERS = 2
+
+
+def _gemini_error_details(err):
+    """Return a short Gemini error status/message without logging the API key."""
+    try:
+        body = err.read().decode("utf-8", errors="replace")
+    except Exception:
+        body = ""
+
+    status = ""
+    message = ""
+    if body:
+        try:
+            error_data = json.loads(body).get("error", {})
+            status = str(error_data.get("status", ""))
+            message = str(error_data.get("message", ""))
+        except (TypeError, ValueError, AttributeError):
+            message = body
+
+    message = " ".join(message.split())
+    if len(message) > 300:
+        message = message[:297] + "..."
+    return status, message
+
+
+def _should_try_next_gemini_model(http_code, status):
+    """Only change model for quota, overload, or unavailable-model errors."""
+    return http_code in (404, 408, 429, 500, 502, 503, 504) or status in {
+        "MODEL_NOT_FOUND",
+        "RESOURCE_EXHAUSTED",
+        "RATE_LIMIT_EXCEEDED",
+        "QUOTA_EXCEEDED",
+        "UNAVAILABLE",
+    }
+
+
+def _parse_srt_content(content: str) -> list[dict]:
+    blocks = []
+    pattern = re.compile(
+        r'(\d+)\s*\n'
+        r'(\d{2}):(\d{2}):(\d{2})[,.](\d{3})\s*-->\s*(\d{2}):(\d{2}):(\d{2})[,.](\d{3})\s*\n'
+        r'(.*?)(?=\n\s*\n\d+|\n\s*$|\Z)',
+        re.DOTALL,
+    )
+    for match in pattern.finditer(content):
+        sh, sm, ss, sms = map(int, match.group(2, 3, 4, 5))
+        eh, em, es, ems = map(int, match.group(6, 7, 8, 9))
+        text = match.group(10).strip()
+        if text:
+            blocks.append({
+                "start_ms": (sh * 3600 + sm * 60 + ss) * 1000 + sms,
+                "end_ms": (eh * 3600 + em * 60 + es) * 1000 + ems,
+                "text": text,
+            })
+    return blocks
+
+
+def _format_srt_blocks(blocks: list[dict], start_index: int = 1) -> str:
+    parts = []
+    for index, block in enumerate(blocks, start=start_index):
+        parts.append(
+            f"{index}\n{_ms_to_srt(int(block['start_ms']))} --> "
+            f"{_ms_to_srt(int(block['end_ms']))}\n{block['text']}"
+        )
+    return "\n\n".join(parts) + "\n"
+
+
+def _write_translated_blocks(path: str, timing_blocks: list[dict], texts: list[str]) -> None:
+    previous_end_ms = 0
+    normalized = []
+    for timing, text in zip(timing_blocks, texts):
+        start_ms = max(int(timing["start_ms"]), previous_end_ms)
+        end_ms = max(int(timing["end_ms"]), start_ms + 1)
+        normalized.append({"start_ms": start_ms, "end_ms": end_ms, "text": text.strip()})
+        previous_end_ms = end_ms
+    with open(path, "w", encoding="utf-8") as output:
+        output.write(_format_srt_blocks(normalized))
+
+
+def _request_gemini_srt_chunk(prompt, api_key, chunk_number, chunk_total, log, slow_notice_sent):
+    translated_text = None
+    last_error = None
+
+    def log_slow_translation():
+        if not slow_notice_sent.is_set():
+            slow_notice_sent.set()
+            log("  [Gemini] SRT hơi dài nên quá trình dịch sẽ tốn hơi nhiều thời gian, vui lòng chờ...")
+
+    stop_trying = False
+    for model_index, model in enumerate(GEMINI_TRANSLATION_MODELS):
+        url = (
+            f"https://generativelanguage.googleapis.com/v1beta/models/"
+            f"{model}:generateContent?key={api_key}"
+        )
+        payload = json.dumps({"contents": [{"parts": [{"text": prompt}]}]}).encode("utf-8")
+        request = urllib.request.Request(
+            url, data=payload, headers={"Content-Type": "application/json"}, method="POST"
+        )
+        has_fallback = model_index + 1 < len(GEMINI_TRANSLATION_MODELS)
+
+        for attempt in range(1, 3):
+            notice_timer = threading.Timer(240.0, log_slow_translation)
+            notice_timer.daemon = True
+            notice_timer.start()
+            try:
+                with urllib.request.urlopen(request, timeout=480) as response:
+                    data = json.loads(response.read().decode("utf-8"))
+                    translated_text = data["candidates"][0]["content"]["parts"][0]["text"].strip()
+                break
+            except urllib.error.HTTPError as err:
+                status, message = _gemini_error_details(err)
+                error_label = status or f"HTTP {err.code}"
+                last_error = f"{error_label}: {message}" if message else error_label
+                if _should_try_next_gemini_model(err.code, status) and has_fallback:
+                    next_model = GEMINI_TRANSLATION_MODELS[model_index + 1]
+                    log(
+                        f"  [Gemini {chunk_number}/{chunk_total}] {model} gặp {error_label}; "
+                        f"chuyển sang {next_model}..."
+                    )
+                else:
+                    stop_trying = True
+                break
+            except (TimeoutError, socket.timeout, urllib.error.URLError) as err:
+                reason = getattr(err, "reason", err)
+                is_timeout = isinstance(reason, (TimeoutError, socket.timeout)) or "timed out" in str(err).lower()
+                last_error = f"Timeout khi chờ model {model}: {err}" if is_timeout else str(err)
+                if not is_timeout:
+                    stop_trying = True
+                    break
+                if attempt < 2:
+                    log(f"  [Gemini {chunk_number}/{chunk_total}] Timeout, đang thử lại (2/2)...")
+                    time.sleep(2)
+                    continue
+                if has_fallback:
+                    log(
+                        f"  [Gemini {chunk_number}/{chunk_total}] {model} vẫn timeout; "
+                        f"chuyển sang {GEMINI_TRANSLATION_MODELS[model_index + 1]}..."
+                    )
+                else:
+                    stop_trying = True
+                break
+            except Exception as err:
+                last_error = str(err)
+                stop_trying = True
+                break
+            finally:
+                notice_timer.cancel()
+
+        if translated_text or stop_trying:
+            break
+
+    if not translated_text:
+        raise RuntimeError(last_error or "Gemini không trả về nội dung dịch.")
+    if translated_text.startswith("```"):
+        lines = translated_text.splitlines()
+        if lines and lines[0].startswith("```"):
+            lines = lines[1:]
+        if lines and lines[-1].startswith("```"):
+            lines = lines[:-1]
+        translated_text = "\n".join(lines).strip()
+    return translated_text
 
 # ──────────────────────────────────────
 # STEP 4 – Translate SRT (Gemini API)
@@ -166,7 +342,7 @@ def translate_srt_gemini(
     api_key: str,
     log=print,
 ) -> str:
-    """Translate SRT subtitles to Vietnamese using Gemini REST API."""
+    """Translate SRT in small parallel chunks while preserving Whisper timing."""
     api_key = api_key.strip()
     if not api_key:
         raise ValueError("Vui lòng nhập Gemini API Key để thực hiện dịch!")
@@ -174,68 +350,95 @@ def translate_srt_gemini(
     if not os.path.exists(srt_path):
         raise FileNotFoundError(f"Không tìm thấy file SRT: {srt_path}")
 
-    with open(srt_path, "r", encoding="utf-8") as f:
-        content = f.read().strip()
-
-    if not content:
+    with open(srt_path, "r", encoding="utf-8-sig") as f:
+        original_blocks = _parse_srt_content(f.read())
+    if not original_blocks:
         raise ValueError("File SRT trống, không thể dịch.")
 
-    log("  [Gemini] Đang gửi nội dung SRT lên Gemini API để dịch sang tiếng Việt...")
-
-    prompt = (
-        "Bạn là một biên dịch viên phụ đề chuyên nghiệp.\n"
-        "Hãy dịch toàn bộ nội dung phụ đề SRT sau đây sang tiếng Việt tự nhiên và chuẩn xác.\n"
-        "QUY TẮC BẮT BUỘC:\n"
-        "1. Giữ NGUYÊN cấu trúc file SRT, số thứ tự (1, 2, 3...) và timestamp (00:00:00,000 --> 00:00:00,000).\n"
-        "2. CHỈ dịch phần câu nói văn bản của từng phụ đề.\n"
-        "3. KHÔNG thêm bất kỳ ghi chú, nhận xét hay định dạng markdown codeblock nào (không dùng ```srt hoặc ```).\n\n"
-        f"Nội dung SRT:\n{content}"
+    chunks = [
+        original_blocks[index:index + GEMINI_CHUNK_SIZE]
+        for index in range(0, len(original_blocks), GEMINI_CHUNK_SIZE)
+    ]
+    total_chunks = len(chunks)
+    worker_count = min(GEMINI_MAX_WORKERS, total_chunks)
+    log(
+        f"  [Gemini] Chia {len(original_blocks)} câu thành {total_chunks} phần "
+        f"(tối đa {GEMINI_CHUNK_SIZE} câu/phần, {worker_count} request song song)."
     )
 
-    models_to_try = ["gemini-2.5-flash", "gemini-1.5-flash", "gemini-2.0-flash"]
-    translated_text = None
-    last_error = None
-
-    for m in models_to_try:
-        url = f"https://generativelanguage.googleapis.com/v1beta/models/{m}:generateContent?key={api_key}"
-        payload = json.dumps({"contents": [{"parts": [{"text": prompt}]}]}).encode("utf-8")
-        req = urllib.request.Request(
-            url, data=payload, headers={"Content-Type": "application/json"}, method="POST"
-        )
-        try:
-            with urllib.request.urlopen(req, timeout=60) as resp:
-                data = json.loads(resp.read().decode("utf-8"))
-                translated_text = data["candidates"][0]["content"]["parts"][0]["text"].strip()
-                log(f"  [Gemini] Dịch thành công với model {m}")
-                break
-        except urllib.error.HTTPError as err:
-            err_body = err.read().decode("utf-8", errors="ignore")
-            last_error = f"HTTP {err.code}: {err_body}"
-        except Exception as err:
-            last_error = str(err)
-
-    if not translated_text:
-        raise RuntimeError(f"Lỗi gọi Gemini API: {last_error}")
-
-    # Xóa định dạng markdown ``` nếu Gemini lỡ thêm vào
-    if translated_text.startswith("```"):
-        lines = translated_text.splitlines()
-        if lines[0].startswith("```"):
-            lines = lines[1:]
-        if lines and lines[-1].startswith("```"):
-            lines = lines[:-1]
-        translated_text = "\n".join(lines).strip()
-
     os.makedirs(os.path.dirname(output_srt_path), exist_ok=True)
-    with open(output_srt_path, "w", encoding="utf-8") as f:
-        f.write(translated_text + "\n")
+    chunk_results = [None] * total_chunks
+    slow_notice_sent = threading.Event()
+
+    def translate_chunk(chunk_index):
+        chunk = chunks[chunk_index]
+        first_number = chunk_index * GEMINI_CHUNK_SIZE + 1
+        chunk_srt = _format_srt_blocks(chunk, start_index=first_number)
+        prompt = (
+            "Bạn là biên dịch viên phụ đề chuyên nghiệp. Dịch SRT sau sang tiếng Việt tự nhiên.\n"
+            "BẮT BUỘC giữ đúng số lượng đoạn, số thứ tự và cấu trúc SRT. Chỉ dịch câu nói; "
+            "không thêm ghi chú hay markdown.\n\n"
+            f"Nội dung SRT:\n{chunk_srt}"
+        )
+        log(f"  [Gemini] Đang dịch phần {chunk_index + 1}/{total_chunks} ({len(chunk)} câu)...")
+        translated = _request_gemini_srt_chunk(
+            prompt, api_key, chunk_index + 1, total_chunks, log, slow_notice_sent
+        )
+        parsed = _parse_srt_content(translated)
+        if len(parsed) != len(chunk):
+            raise RuntimeError(
+                f"phần {chunk_index + 1}/{total_chunks} trả thiếu/thừa câu "
+                f"({len(parsed)}/{len(chunk)})"
+            )
+        return [block["text"] for block in parsed]
+
+    executor = ThreadPoolExecutor(max_workers=worker_count, thread_name_prefix="gemini_srt")
+    futures = {executor.submit(translate_chunk, index): index for index in range(total_chunks)}
+    try:
+        for future in as_completed(futures):
+            chunk_index = futures[future]
+            try:
+                chunk_results[chunk_index] = future.result()
+            except Exception as err:
+                for pending in futures:
+                    pending.cancel()
+                raise RuntimeError(
+                    f"Lỗi gọi Gemini API ở phần {chunk_index + 1}/{total_chunks}: {err}"
+                ) from err
+
+            log(f"  [Gemini] Hoàn thành phần {chunk_index + 1}/{total_chunks}.")
+
+            # Save every contiguous completed prefix as a recoverable checkpoint.
+            completed_chunks = 0
+            while completed_chunks < total_chunks and chunk_results[completed_chunks] is not None:
+                completed_chunks += 1
+            if completed_chunks:
+                checkpoint_texts = [
+                    text
+                    for result in chunk_results[:completed_chunks]
+                    for text in result
+                ]
+                checkpoint_count = len(checkpoint_texts)
+                _write_translated_blocks(
+                    output_srt_path,
+                    original_blocks[:checkpoint_count],
+                    checkpoint_texts,
+                )
+    finally:
+        executor.shutdown(wait=True, cancel_futures=True)
+
+    all_texts = [text for result in chunk_results for text in result]
+    _write_translated_blocks(output_srt_path, original_blocks, all_texts)
 
     log(f"  [Gemini] File SRT tiếng Việt đã lưu tại: {output_srt_path}")
     return output_srt_path
 
 
-import re
-from capcut_tts_api import CapCutClient
+from capcut_tts_api import (
+    CapCutClient,
+    CapCutTaskError,
+)
+from capcut_tts_transport import CapCutTransportError, create_tts_session
 from pycapcut import (
     DraftFolder, VideoMaterial, VideoSegment,
     Timerange, TrackType, TextStyle,
@@ -252,28 +455,7 @@ def parse_srt_blocks(srt_path: str) -> list[dict]:
     if not os.path.exists(srt_path):
         return []
     with open(srt_path, "r", encoding="utf-8-sig") as f:
-        content = f.read()
-
-    blocks = []
-    pattern = re.compile(
-        r'(\d+)\s*\n'
-        r'(\d{2}):(\d{2}):(\d{2})[,.](\d{3})\s*-->\s*(\d{2}):(\d{2}):(\d{2})[,.](\d{3})\s*\n'
-        r'(.*?)(?=\n\s*\n\d+|\n\s*$|\Z)',
-        re.DOTALL
-    )
-    for match in pattern.finditer(content):
-        sh, sm, ss, sms = map(int, match.group(2, 3, 4, 5))
-        eh, em, es, ems = map(int, match.group(6, 7, 8, 9))
-        text = match.group(10).strip()
-        if text:
-            start_ms = (sh * 3600 + sm * 60 + ss) * 1000 + sms
-            end_ms = (eh * 3600 + em * 60 + es) * 1000 + ems
-            blocks.append({
-                'start_ms': start_ms,
-                'end_ms': end_ms,
-                'text': text
-            })
-    return blocks
+        return _parse_srt_content(f.read())
 
 
 def extract_audio_url_and_duration(res: dict) -> tuple[str, int]:
@@ -304,6 +486,144 @@ def extract_audio_url_and_duration(res: dict) -> tuple[str, int]:
 import shutil
 
 
+def _wait_tts(seconds: float, cancel_event=None) -> None:
+    """Wait without making the Cancel button unresponsive."""
+    deadline = time.monotonic() + max(0.0, seconds)
+    while time.monotonic() < deadline:
+        check_cancelled(cancel_event)
+        time.sleep(min(0.1, max(0.0, deadline - time.monotonic())))
+
+
+def _tts_retry_delay(error: CapCutTransportError, attempt: int) -> float:
+    if error.status_code == 429 and error.retry_after is not None:
+        return min(60.0, max(0.0, error.retry_after))
+    return float(2 ** attempt)
+
+
+def generate_tts_with_retry(
+    client: CapCutClient,
+    text: str,
+    voice_type: str,
+    log=print,
+    cancel_event=None,
+    retries: int = 3,
+    task_timeout: float = 90.0,
+) -> dict:
+    """Create one TTS task and poll it without recreating accepted tasks."""
+    retries = max(1, int(retries))
+    create_res = None
+    for attempt in range(1, retries + 1):
+        check_cancelled(cancel_event)
+        try:
+            create_res = client.create_tts_task(text, voice=voice_type)
+            break
+        except CapCutTransportError as exc:
+            if not exc.retryable_create or attempt >= retries:
+                raise
+            delay = _tts_retry_delay(exc, attempt)
+            log(
+                f"  [CapCut TTS] Lỗi {exc.kind} khi tạo task "
+                f"(lần {attempt}/{retries}); thử lại sau {delay:g} giây."
+            )
+            _wait_tts(delay, cancel_event)
+
+    tasks = (create_res.get("data") or {}).get("tasks") or []
+    if not tasks:
+        raise CapCutTaskError(f"No task returned from API: {create_res}")
+    task_id = tasks[0]["id"]
+    token = tasks[0]["token"]
+
+    started = time.monotonic()
+    poll_failures = 0
+    while time.monotonic() - started < task_timeout:
+        check_cancelled(cancel_event)
+        try:
+            query_res = client.query_tts_task(task_id, token)
+            poll_failures = 0
+        except CapCutTransportError as exc:
+            poll_failures += 1
+            if not exc.retryable_poll or poll_failures >= retries:
+                raise
+            delay = _tts_retry_delay(exc, poll_failures)
+            log(
+                f"  [CapCut TTS] Lỗi {exc.kind} khi kiểm tra task "
+                f"(lần {poll_failures}/{retries}); thử lại sau {delay:g} giây."
+            )
+            _wait_tts(delay, cancel_event)
+            continue
+
+        query_tasks = (query_res.get("data") or {}).get("tasks") or []
+        if query_tasks:
+            status = query_tasks[0].get("status")
+            if status in ("succeed", "success", 2, "2"):
+                return query_res
+            if status in ("failed", "fail", 3, "3"):
+                raise CapCutTaskError(f"TTS Task failed: {query_res}")
+        _wait_tts(1.0, cancel_event)
+
+    raise CapCutTaskError(f"TTS Task timed out after {task_timeout:g} seconds")
+
+
+def download_tts_audio(
+    session,
+    url: str,
+    output_path: str,
+    log=print,
+    cancel_event=None,
+    retries: int = 3,
+) -> None:
+    """Download generated MP3 through the selected TTS transport."""
+    retries = max(1, int(retries))
+    part_path = output_path + ".part"
+
+    for attempt in range(1, retries + 1):
+        check_cancelled(cancel_event)
+        try:
+            response = session.get(url, timeout=60)
+            status_code = int(getattr(response, "status_code", 0) or 0)
+            if status_code >= 500:
+                raise CapCutTransportError(
+                    kind="http",
+                    message=f"Máy chủ audio CapCut tạm thời lỗi HTTP {status_code}.",
+                    status_code=status_code,
+                )
+            if status_code >= 400:
+                raise RuntimeError(f"Tải MP3 bị từ chối với HTTP {status_code}.")
+
+            content = response.content
+            if not content:
+                raise CapCutTransportError(
+                    kind="read_timeout",
+                    message="File audio CapCut tải về bị trống.",
+                )
+
+            check_cancelled(cancel_event)
+            with open(part_path, "wb") as output:
+                output.write(content)
+            os.replace(part_path, output_path)
+            return
+        except PipelineCancelledException:
+            if os.path.exists(part_path):
+                os.remove(part_path)
+            raise
+        except CapCutTransportError as exc:
+            if os.path.exists(part_path):
+                os.remove(part_path)
+            retryable = exc.retryable_poll or exc.status_code >= 500
+            if not retryable or attempt >= retries:
+                raise
+            delay = _tts_retry_delay(exc, attempt)
+            log(
+                f"  [CapCut TTS] Lỗi {exc.kind} khi tải MP3 "
+                f"(lần {attempt}/{retries}); thử lại sau {delay:g} giây."
+            )
+            _wait_tts(delay, cancel_event)
+        except Exception:
+            if os.path.exists(part_path):
+                os.remove(part_path)
+            raise
+
+
 def generate_tts_audio_segments(
     srt_path: str,
     voice_type: str = "BV421_vivn_streaming",
@@ -322,10 +642,14 @@ def generate_tts_audio_segments(
 
     temp_dir = tempfile.mkdtemp(prefix="bilicut_tts_")
     log(f"  [CapCut TTS] Đang tạo giọng đọc '{voice_type}' cho {len(blocks)} câu phụ đề...")
-    client = CapCutClient()
+    tts_session = create_tts_session()
+    client = CapCutClient(session=tts_session)
+    log(f"  [CapCut TTS] Transport: {tts_session.transport_name}")
     audio_items = []
 
     for i, block in enumerate(blocks, start=1):
+        if i > 1:
+            _wait_tts(0.25, cancel_event)
         check_cancelled(cancel_event)
         text = block['text']
         start_us = block['start_ms'] * 1000
@@ -335,7 +659,13 @@ def generate_tts_audio_segments(
         log(f"  [CapCut TTS {i}/{len(blocks)}] Đọc: \"{preview_text}\"")
 
         try:
-            res = client.generate_speech(text, voice=voice_type, wait=True)
+            res = generate_tts_with_retry(
+                client=client,
+                text=text,
+                voice_type=voice_type,
+                log=log,
+                cancel_event=cancel_event,
+            )
             check_cancelled(cancel_event)
             url, _ = extract_audio_url_and_duration(res)
             if not url:
@@ -343,18 +673,26 @@ def generate_tts_audio_segments(
                 continue
 
             mp3_path = os.path.join(temp_dir, f"tts_{i:04d}.mp3")
-            urllib.request.urlretrieve(url, mp3_path)
+            download_tts_audio(
+                session=tts_session,
+                url=url,
+                output_path=mp3_path,
+                log=log,
+                cancel_event=cancel_event,
+            )
             audio_items.append({
                 "path": mp3_path,
                 "start_us": start_us,
                 "end_us": block['end_ms'] * 1000,
             })
         except PipelineCancelledException:
+            tts_session.close()
             shutil.rmtree(temp_dir, ignore_errors=True)
             raise
         except Exception as exc:
             log(f"  [CapCut TTS {i}] Lỗi tạo giọng đọc câu này: {exc}")
 
+    tts_session.close()
     log(f"  [CapCut TTS] Hoàn tất tạo {len(audio_items)} đoạn âm thanh.")
     return audio_items, temp_dir
 
@@ -658,6 +996,7 @@ def run_pipeline(
     srt_vi = tmp_vi.name
 
     temp_tts_dir = None
+    keep_temp_orig = False
 
     try:
         check_cancelled(cancel_event)
@@ -716,12 +1055,40 @@ def run_pipeline(
         srt_to_use = srt_orig
         if enable_translation:
             log("\n[4/6] Translating SRT to Vietnamese via Gemini API...")
-            srt_to_use = translate_srt_gemini(
-                srt_path=srt_orig,
-                output_srt_path=srt_vi,
-                api_key=gemini_api_key,
-                log=log,
-            )
+            try:
+                srt_to_use = translate_srt_gemini(
+                    srt_path=srt_orig,
+                    output_srt_path=srt_vi,
+                    api_key=gemini_api_key,
+                    log=log,
+                )
+            except Exception:
+                # Translation failure must still abort the pipeline, but the
+                # Whisper result is valuable and must not be discarded.
+                preserved_srt = os.path.join(
+                    os.path.dirname(os.path.abspath(video_path)),
+                    f"{base}_{ts}_original.srt",
+                )
+                try:
+                    shutil.copy2(srt_orig, preserved_srt)
+                    log(f"  [SRT] Dịch thất bại. Đã giữ SRT gốc tại: {preserved_srt}")
+                except Exception as preserve_error:
+                    keep_temp_orig = True
+                    log(
+                        f"  [SRT] Không thể sao chép SRT cạnh video ({preserve_error}). "
+                        f"Đã giữ file tạm tại: {srt_orig}"
+                    )
+                if os.path.exists(srt_vi) and os.path.getsize(srt_vi) > 0:
+                    partial_srt = os.path.join(
+                        os.path.dirname(os.path.abspath(video_path)),
+                        f"{base}_{ts}_partial_vi.srt",
+                    )
+                    try:
+                        shutil.copy2(srt_vi, partial_srt)
+                        log(f"  [SRT] Đã giữ phần dịch hoàn tất tại: {partial_srt}")
+                    except Exception as partial_error:
+                        log(f"  [SRT] Không thể giữ bản dịch tạm: {partial_error}")
+                raise
         else:
             log("\n[4/6] Translation disabled, using original SRT.")
 
@@ -770,7 +1137,10 @@ def run_pipeline(
         # Tự động xóa các thư mục và file tạm
         if temp_tts_dir and os.path.exists(temp_tts_dir):
             shutil.rmtree(temp_tts_dir, ignore_errors=True)
-        for tmp_file in [srt_orig, srt_vi]:
+        files_to_remove = [srt_vi]
+        if not keep_temp_orig:
+            files_to_remove.append(srt_orig)
+        for tmp_file in files_to_remove:
             if os.path.exists(tmp_file):
                 try:
                     os.remove(tmp_file)
