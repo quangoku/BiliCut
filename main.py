@@ -376,6 +376,7 @@ def translate_srt_gemini(
         chunk_srt = _format_srt_blocks(chunk, start_index=first_number)
         prompt = (
             "Bạn là biên dịch viên phụ đề chuyên nghiệp. Dịch SRT sau sang tiếng Việt tự nhiên.\n"
+            "Với ngôi thứ nhất, hãy xưng hô nhất quán bằng 'tôi' cho số ít và 'chúng ta' cho số nhiều.\n"
             "BẮT BUỘC giữ đúng số lượng đoạn, số thứ tự và cấu trúc SRT. Chỉ dịch câu nói; "
             "không thêm ghi chú hay markdown.\n\n"
             f"Nội dung SRT:\n{chunk_srt}"
