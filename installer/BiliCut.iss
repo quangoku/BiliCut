@@ -1,5 +1,5 @@
 #define MyAppName "BiliCut"
-#define MyAppVersion "1.0.0"
+#define MyAppVersion "2.1.0"
 #define MyAppPublisher "BiliCut"
 #define MyAppExeName "BiliCut.exe"
 

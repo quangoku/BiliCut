@@ -134,7 +134,7 @@ MONO     = ("Consolas", 9)
 SANS     = ("Segoe UI", 10)
 SANS_B   = ("Segoe UI Semibold", 11)
 
-MODELS = ["tiny", "base", "small", "medium", "large"]
+MODELS = ["tiny", "base", "small", "medium"]
 MODEL_INFO = {
     "tiny": {
         "size": "~75 MB",
@@ -155,11 +155,6 @@ MODEL_INFO = {
         "size": "~1.5 GB",
         "memory": "~2.6 GB RAM",
         "summary": "Chính xác cao · xử lý chậm hơn",
-    },
-    "large": {
-        "size": "~2.9 GB",
-        "memory": "~4.7 GB RAM",
-        "summary": "Chính xác cao nhất · cần máy mạnh",
     },
 }
 LANGUAGES = [
